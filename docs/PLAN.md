@@ -1,6 +1,17 @@
 # Plan: multi-harness, multi-host sessions
 
-Status: DRAFT for review. The name is not decided yet (see §1); `NAME` below stands in for it.
+Status (2026-10-01): phases 1 to 5 are done; the name is **hopback** (`NAME` below). Next is phase 6.
+
+| Phase | State | Notes |
+|---|---|---|
+| 1. Refactor into adapters | done | `hopback/adapters/`, `Source` in `sources.py` |
+| 2. Windows Claude | done | Found via `/mnt/c/Users/<you>`; resumed through PowerShell. Verified end to end against a real Windows store; the real Windows sessions' agents are not installed on Windows, so the wrapper's "not installed" path was exercised, plus a positive control with a Windows program |
+| 3. Codex (WSL + Windows) | done | Handles both rollout event formats (`user_message` and `item_completed`) and the `\\?\` path prefix |
+| 4. Hermes | done | Every profile; `-p` always passed; cron has its own toggle |
+| 5. UI | done, minus group-by-directory | Tabs, host filter, two toggles, uniform preview, ranked search. Group-by-directory (Option D) deferred |
+| 6. Tier-2 adapters | next | Start with Qwen Code (closest format) and Copilot CLI |
+
+Decisions taken: default shows every host, clearly labelled (SOURCE column, host counts, CTRL-O filter); Hermes cron runs get their own CTRL-R toggle; repo renamed after phase 1.
 Research sources: `docs/research/*.md` (four reports, 2026-10-01).
 
 ## 1. Name
@@ -144,9 +155,9 @@ Changes shared by all the options:
 
 Every phase needs a runnable check: a per-adapter fixture (a tiny fake store) and an assert-based test that `list`, `preview` and `resume_cmd` return the expected rows and command lines. These fixtures are also used to build the screenshots.
 
-## 6. Open questions
+## 6. Open questions (resolved)
 
-1. The name: `hopback`, another free name, or still `ai-sessions` despite the competing project?
-2. Should the default mode show **every host**, or only the current one plus a hint like "+27 Windows sessions, press H"?
-3. Should Hermes cron runs (204 of 290) be hidden like agent sessions, or have a separate toggle?
-4. Rename the repo now, or after phase 1 lands?
+1. The name: **hopback**.
+2. Default: **every host**, well organized and labelled.
+3. Hermes cron runs: **their own toggle** (CTRL-R).
+4. Repo renamed **after phase 1** landed.

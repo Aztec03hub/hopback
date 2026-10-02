@@ -1,26 +1,23 @@
 """A Source is one session store: which host it lives on, which harness wrote
 it, and where its root directory is. Every row in the picker carries one.
 
-Phase 1 discovers only the local Claude Code store. Later phases add the
-Windows-side stores seen from WSL and the other harness adapters here.
+Discovery looks in this machine's home directory and, from WSL, also in the
+Windows user profile (/mnt/c/Users/<you>), so sessions from both sides of a
+WSL laptop show up together, each labelled with where it came from.
 """
-import platform
+import os
+import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
-from .adapters import claude
+from .adapters import ADAPTERS
+from .paths import is_win_path, powershell, ps_quote, this_host, to_local, windows_home
 
+SAFE_ID = re.compile(r"[\w.:-]+")
 SRCW = 11  # width of the SOURCE column, fits "hermes·wsl"
-
-
-def this_host():
-    try:
-        if "microsoft" in Path("/proc/version").read_text().lower():
-            return "wsl"
-    except OSError:
-        pass
-    return {"Darwin": "mac", "Windows": "win"}.get(platform.system(), "linux")
+HOSTS = {"wsl": "WSL", "win": "Windows", "linux": "Linux", "mac": "macOS"}
 
 
 @dataclass(frozen=True)
@@ -33,9 +30,80 @@ class Source:
     def tag(self):
         return f"{self.adapter.NAME}·{self.host}"
 
+    @property
+    def label(self):
+        return f"{self.adapter.LABEL} on {HOSTS.get(self.host, self.host)}"
 
-def discover():
+    @property
+    def foreign(self):
+        """True when sessions here belong to another OS than the one running us."""
+        return self.host != this_host()
+
+    def launch(self, row, yolo):
+        """(argv, directory to run it in, human-readable command).
+
+        A local session runs its harness directly in the session's directory.
+        A Windows session seen from WSL must run on Windows, in its Windows
+        directory, so it is handed to PowerShell, which also reports clearly
+        when the harness is not installed on that side.
+        """
+        argv = self.adapter.resume_cmd(self.root, row, yolo)
+        cwd = row["cwd"]
+        # Ids come from files on disk; anything but a plain token is refused
+        # rather than passed to a shell or to PowerShell.
+        if not SAFE_ID.fullmatch(row["id"]):
+            raise RuntimeError(f"refusing to resume an unusual session id: {row['id']!r}")
+        if self.host == "win" and this_host() == "wsl":
+            ps = powershell()
+            if not ps:
+                raise RuntimeError("no PowerShell found under /mnt/c to run a Windows session")
+            win_cwd = cwd if is_win_path(cwd) else ""
+            exe = ps_quote(argv[0])
+            script = (f"if (-not (Get-Command {exe} -ErrorAction SilentlyContinue)) "
+                      f"{{ Write-Host '{argv[0]} is not installed on Windows (not on PATH).'; "
+                      f"exit 127 }}; ")
+            if win_cwd:
+                # -ErrorAction Stop: if the folder is gone, stop here rather
+                # than start the agent somewhere else.
+                script += (f"Set-Location -LiteralPath {ps_quote(win_cwd)} "
+                           f"-ErrorAction Stop; ")
+            script += "& " + " ".join(ps_quote(a) for a in argv)
+            local = to_local(win_cwd) if win_cwd else None
+            run_in = local if local and Path(local).is_dir() else "/mnt/c"
+            shown = f"[Windows] {'cd ' + win_cwd + ' && ' if win_cwd else ''}{' '.join(argv)}"
+            return [ps, "-NoLogo", "-NoProfile", "-Command", script], run_in, shown
+        shown = " ".join(shlex.quote(a) for a in argv)
+        if cwd:
+            shown = f"cd {shlex.quote(cwd)} && {shown}"
+        return argv, cwd, shown
+
+
+def homes():
+    """(host, home directory) pairs to search, this machine's first."""
+    found = [(this_host(), Path.home())]
+    # HOPBACK_WINDOWS_HOME points at a Windows profile directly (tests, demos,
+    # unusual mounts); HOPBACK_NO_WINDOWS turns the Windows side off.
+    override = os.environ.get("HOPBACK_WINDOWS_HOME")
+    if override:
+        found.append(("win", Path(override)))
+    elif os.environ.get("HOPBACK_NO_WINDOWS") is None:
+        win = windows_home()
+        if win and win.resolve() != Path.home().resolve():
+            found.append(("win", win))
+    return found
+
+
+def discover(harness=None, host=None):
+    """Every store found, optionally narrowed to one harness and/or one host."""
     found = []
-    if (claude.DEFAULT_ROOT / "projects").is_dir():
-        found.append(Source(this_host(), claude, claude.DEFAULT_ROOT))
+    for h, home in homes():
+        if host and h != host:
+            continue
+        for adapter in ADAPTERS:
+            if harness and adapter.NAME != harness:
+                continue
+            try:
+                found += [Source(h, adapter, root) for root in adapter.roots(home)]
+            except OSError:
+                continue  # an unreadable home must not take the others down
     return found

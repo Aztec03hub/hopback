@@ -10,7 +10,15 @@ from pathlib import Path
 from ..fmt import size_str
 
 NAME = "claude"
-DEFAULT_ROOT = Path.home() / ".claude"
+LABEL = "Claude Code"
+ASSISTANT = "Claude"
+EXE = "claude"
+
+
+def roots(home):
+    root = home / ".claude"
+    return [root] if (root / "projects").is_dir() else []
+
 # Read at most this much from the end of a file when hunting for fields. Titles
 # recur often enough that the tail almost always carries one; --deep covers the
 # rare session titled only at the very start. Measured identical on this store.
@@ -122,13 +130,17 @@ def team_leads(root):
 def decode_dir(project_dir):
     """Fallback cwd when no record carried one.
 
-    LOSSY, and marked with "?" wherever used. The store encodes a path by
+    LOSSY, and marked with "?" wherever used. A Windows store encodes
+    C:\\Users\\me as "C--Users-me", which is decoded back to a Windows path. The store encodes a path by
     replacing both "/" and "_" with "-", so the reverse is ambiguous:
     "-home-me-claude-projects" could be ~/claude_projects or
     ~/claude/projects and nothing in the name says which. Only empty sessions
     reach this path, and a directory that does not exist is never chdir'd into.
     """
-    return "/" + project_dir.name.lstrip("-").replace("-", "/")
+    name = project_dir.name
+    if len(name) > 2 and name[0].isalpha() and name[1:3] == "--":
+        return name[0] + ":\\" + name[3:].replace("-", "\\")
+    return "/" + name.lstrip("-").replace("-", "/")
 
 
 def head_facts(path, max_lines=25, max_bytes=512 * 1024):
@@ -457,7 +469,7 @@ def find_session(root, sid):
 
 
 def collect(root, limit, here_only, deep, include_teams=True, include_scratch=False,
-            include_empty=False, limit_counts_visible=False):
+            include_empty=False, limit_counts_visible=False, **_):
     """Walk the store newest-first.
 
     limit_counts_visible exists for the picker, which LOADS agent sessions so
@@ -526,92 +538,51 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
     return rows, len(files)
 
 
-def preview_text(root, sid, width=80):
-    """The preview pane's contents, as a string.
-
-    Returned rather than printed so the UI can render it; --preview prints it so
-    the same output can be checked from a shell.
-    """
-    out = []
+def details(root, sid):
+    """Everything the preview pane shows for one session; see adapters/__init__."""
     path = find_session(root, sid)
     if not path:
-        return "session file not found"
+        return None
     got = scan(path, want_prompt=True)
     st = path.stat()
-    name = (got.get("customTitle") or got.get("aiTitle")
-            or got.get("agentName") or "(untitled)")
-    out.append(f"{name}\n")
+    fields = []
     if got.get("customTitle") and got.get("aiTitle"):
-        out.append(f"  generated title  {got['aiTitle']}")
-    out.append(f"  directory        {got.get('cwd') or decode_dir(path.parent)}")
-    branch = got.get("gitBranch")
-    if branch:
-        out.append(f"  git branch       {branch}")
-    out.append(f"  last active      "
-               f"{time.strftime('%a %-d %b %Y, %-I:%M %p', time.localtime(st.st_mtime))}")
-    model = got.get("model")
-    if model:
-        out.append(f"  model            {model}")
+        fields.append(("generated title", got["aiTitle"]))
+    fields.append(("directory", got.get("cwd") or decode_dir(path.parent)))
+    if got.get("gitBranch"):
+        fields.append(("git branch", got["gitBranch"]))
+    fields.append(("last active", time.strftime("%a %-d %b %Y, %-I:%M %p",
+                                                time.localtime(st.st_mtime))))
+    if got.get("model"):
+        fields.append(("model", got["model"]))
     cost, exact, added, removed = session_cost(path)
     if isinstance(cost, (int, float)) and cost > 0:
-        out.append(f"  cost             ${cost:,.2f}" if exact else
-                   f"  cost             ≈ ${cost:,.2f}  (estimated, see README FAQ)")
+        fields.append(("cost", f"${cost:,.2f}" if exact else
+                       f"≈ ${cost:,.2f}  (estimated, see README FAQ)"))
     if isinstance(added, int) and isinstance(removed, int) and (added or removed):
-        out.append(f"  lines changed    +{added:,} / -{removed:,}")
-    out.append(f"  size             {size_str(st.st_size)}")
+        fields.append(("lines changed", f"+{added:,} / -{removed:,}"))
+    fields.append(("size", size_str(st.st_size)))
     if got.get("teamName"):
-        out.append(f"  agent team       teammate in {got['teamName']}")
+        fields.append(("agent team", f"teammate in {got['teamName']}"))
         if got.get("agentName"):
-            out.append(f"  agent name       {got['agentName']}")
+            fields.append(("agent name", got["agentName"]))
     else:
         leads = team_leads(root)
         if sid in leads:
-            nm, count = leads[sid]
-            out.append(f"  agent team       LEAD of {nm}, {count} members")
-    out.append(f"  id               {sid}\n")
-
-    wrap = max(30, width - 4)
-
-    def wrapped(text, limit=None):
-        if limit and len(text) > limit:
-            text = text[:limit].rstrip() + "…"
-        for para in text.splitlines():
-            if not para.strip():
-                out.append("")
-                continue
-            line = ""
-            for wd in para.split():
-                if len(line) + len(wd) + 1 > wrap:
-                    out.append("  " + line)
-                    line = wd
-                else:
-                    line = f"{line} {wd}".strip()
-            if line:
-                out.append("  " + line)
-
-    # Fixed order, always all three, so the pane has the same shape every time
-    # and a missing piece is visible rather than silently absent.
+            nm, n = leads[sid]
+            fields.append(("agent team", f"LEAD of {nm}, {n} members"))
     by_role = last_by_role(path)
-    prompt = got.get("lastPrompt") or by_role.get("user")
-    reply = by_role.get("assistant")
-    opening = first_prompt(path)
-    if opening and prompt and opening.strip() == str(prompt).strip():
-        opening = ""  # a one-exchange session would otherwise print it twice
-
-    for label, body, limit in (("last prompt", prompt, 700),
-                               ("last msg from Claude", reply, 700),
-                               ("started with", opening, 500)):
-        out.append(f"▸ {label}\n")
-        if body:
-            wrapped(str(body), limit)
-        else:
-            out.append("  (no record)")
-        out.append("")
-    return "\n".join(out)
+    return {
+        "title": (got.get("customTitle") or got.get("aiTitle")
+                  or got.get("agentName") or "(untitled)"),
+        "fields": fields,
+        "prompt": got.get("lastPrompt") or by_role.get("user"),
+        "reply": by_role.get("assistant"),
+        "opening": first_prompt(path),
+    }
 
 
-
-def resume_cmd(row, yolo):
+def resume_cmd(root, row, yolo):
     cmd = ["claude", "--resume", row["id"]]
     return cmd + [DANGER_FLAG] if yolo else cmd
 

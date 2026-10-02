@@ -1,0 +1,35 @@
+"""One module per harness. Each module provides:
+
+    NAME, LABEL, ASSISTANT, EXE   short id, display name, who replies, its command
+    roots(home) -> [Path]         store roots under a user home, if any exist
+    collect(root, limit, here_only, deep, include_teams=..., include_scratch=...,
+            include_empty=..., limit_counts_visible=..., include_archived=...)
+                                  -> (rows, total sessions in the store)
+    details(root, id) -> dict     title, fields [(label, value)], prompt, reply,
+                                  opening; None if the id is not in this store
+    resume_cmd(root, row, yolo)   argv that resumes the session
+    ids(root), count(root)
+
+A row is a dict with: id, name, cwd, mtime, bytes (or size_text), role, team,
+agent, named, guessed. `role` is "" for a session a person started, or one of
+the badges in ROLES. The picker adds `source` itself.
+"""
+from . import claude, codex, hermes
+
+ADAPTERS = [claude, codex, hermes]
+BY_NAME = {a.NAME: a for a in ADAPTERS}
+
+# Badge -> legend text. AGENT roles hide behind CTRL-T, SCHEDULED behind CTRL-R.
+ROLES = {
+    "lead": "led an agent team",
+    "team": "was a teammate",
+    "sub": "subagent",
+    "sdk": "Agent SDK run",
+    "exec": "codex exec run",
+    "task": "kanban task",
+    "cron": "scheduled run",
+    "chat": "chat gateway",
+    "ide": "started in an editor",
+}
+AGENT = {"team", "sub", "sdk", "exec", "task"}
+SCHEDULED = {"cron"}
