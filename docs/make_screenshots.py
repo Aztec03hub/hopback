@@ -15,7 +15,6 @@ import shutil
 import subprocess
 import sys
 import time
-import types
 import uuid
 from pathlib import Path
 
@@ -141,10 +140,10 @@ def build_store():
 
 
 def load_tool():
-    src = HERE.parent / "claude-sessions"
-    mod = types.ModuleType("cs")
-    exec(compile(src.read_text(), str(src), "exec"), mod.__dict__)
-    return mod
+    sys.path.insert(0, str(HERE.parent))
+    from hopback import cli, sources
+    cli.discover = sources.discover
+    return cli
 
 
 def scrub(out):
@@ -164,7 +163,8 @@ def scrub(out):
 
 
 async def shoot(cs, name, keys=(), query="", hover=None):
-    rows, total = cs.collect(300, False, False, include_teams=True, include_scratch=True,
+    rows, total = cs.load_rows(cs.discover(), 300, False, False, include_teams=True,
+                               include_scratch=True,
                              limit_counts_visible=True)
     app = cs.build_app(rows, query, False, total, False)
     async with app.run_test(size=(132, 62)) as pilot:
@@ -181,17 +181,18 @@ async def shoot(cs, name, keys=(), query="", hover=None):
 
 
 def shoot_list(name):
-    """`claude-sessions -l`, rendered the way a terminal shows it."""
+    """`hopback -l`, rendered the way a terminal shows it."""
     from rich.console import Console
     from rich.text import Text
-    res = subprocess.run([sys.executable, str(HERE.parent / "claude-sessions"), "-l", "-t", "-s"],
+    res = subprocess.run([sys.executable, "-m", "hopback", "-l", "-t", "-s"],
+                         cwd=str(HERE.parent),
                          capture_output=True, text=True)
     con = Console(record=True, width=170, file=open(os.devnull, "w"))
-    con.print(Text("$ claude-sessions -l -t", style="bold #7aa2f7"))
+    con.print(Text("$ hopback -l -t", style="bold #7aa2f7"))
     con.print(Text(res.stdout.rstrip()))
     con.print(Text(res.stderr.rstrip(), style="#565f89"))
     out = HERE / f"{name}.svg"
-    out.write_text(con.export_svg(title="claude-sessions -l"))
+    out.write_text(con.export_svg(title="hopback -l"))
     scrub(out)
 
 

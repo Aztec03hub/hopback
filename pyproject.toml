@@ -1,0 +1,18 @@
+[project]
+name = "hopback"
+version = "0.2.0"
+description = "Browse and resume AI coding-agent sessions from any directory"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["textual>=8.2"]
+
+[project.scripts]
+hopback = "hopback.cli:run"
+claude-sessions = "hopback.cli:run"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hopback", "hopback.adapters"]
