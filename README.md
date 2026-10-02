@@ -26,7 +26,7 @@ From inside WSL, hopback also looks in your Windows profile (`/mnt/c/Users/<you>
 - **Harness tabs** (`All · Claude Code · OpenAI Codex · Hermes Agent`), each with a live count; `TAB` cycles them, or click one
 - A **host filter** (`CTRL-O` or click): all hosts, then this one, then Windows, with per-host counts
 - Columns: last active ("3h ago, 2:15 PM", "a day ago, …", then "Sep 4"), **source** (`codex·win`), role, name, directory, size
-- Roles, each with a badge: `lead` and `team` (Claude agent teams), `sub` (subagents), `sdk` (Agent SDK runs), `exec` (`codex exec` runs), `task` (Hermes kanban), `cron` (scheduled runs), `chat` (Hermes chat gateways)
+- Roles, each with a badge: `lead` and `team` (Claude agent teams), `sub` (subagents), `sdk` (Agent SDK runs), `exec` (`codex exec` runs), `task` (Hermes kanban), `cron` (scheduled runs), `chat` (Hermes chat gateways), `ide` (Codex threads started from an editor)
 - **Agent sessions** are hidden by default (`CTRL-T`), and **scheduled runs** have their own toggle (`CTRL-R`)
 - A preview pane with the same shape for every agent: source, directory, git branch, model, cost or tokens, lines changed, the exact **resume command**, the **last prompt**, the **agent's last message** and the **opening prompt**
 - Sessions in `/tmp`, empty sessions and archived sessions are hidden by default
