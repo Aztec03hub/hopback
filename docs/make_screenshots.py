@@ -9,6 +9,7 @@ Textual's test pilot, and saves SVGs next to this file.
 """
 import asyncio
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -31,7 +32,7 @@ H = 3600
 SESSIONS = [
     (4 * 60, "projects/acme-api", "Rate limiter for public API", True,
      "Add per-key rate limiting to the public API", "Now add a Redis backend for the limiter",
-     "Done. The limiter now uses Redis with a sliding window; 14 tests pass.", "cli", "feat/rate-limit", 3.42, 900),
+     "Done. The limiter now uses Redis with a sliding window; 14 tests pass.", "live", "feat/rate-limit", 3.42, 900),
     (50 * 60, "projects/acme-web", "Dark mode toggle", False,
      "Add a dark mode toggle to the settings page", "Make it follow the system theme by default",
      "It now reads prefers-color-scheme on first load and remembers overrides.", "cli", "main", 1.18, 300),
@@ -100,15 +101,27 @@ def build_store():
         recs.append({"type": "assistant", "cwd": cwd,
                      "message": {"role": "assistant", "model": "claude-opus-5-5",
                                  "content": [{"type": "text", "text": reply}]}})
-        if cost:
+        if kind == "live":
+            # Still running: no cost record yet, only per-reply usage, so the
+            # picker shows an estimate priced from the other sessions' records.
+            recs.append({"type": "assistant", "cwd": cwd, "timestamp": "2026-01-01T00:00:00Z",
+                         "message": {"id": "msg_live", "role": "assistant", "model": "claude-opus-5-5",
+                                     "usage": {"input_tokens": 9000, "output_tokens": 61000,
+                                               "cache_read_input_tokens": 2400000,
+                                               "cache_creation_input_tokens": 180000},
+                                     "content": [{"type": "text", "text": reply}]}})
+        elif cost:
             recs.append({"type": "cost-state", "totalCostUSD": cost,
-                         "totalLinesAdded": int(cost * 210), "totalLinesRemoved": int(cost * 60)})
+                         "totalLinesAdded": int(cost * 210), "totalLinesRemoved": int(cost * 60),
+                         "modelUsage": {"claude-opus-5-5": {
+                             "inputTokens": 1000, "outputTokens": int(cost * 8000), "cacheReadInputTokens": 0,
+                             "cacheCreationInputTokens": 0, "costUSD": cost}}})
         if title:
             recs.append({"type": "ai-title", "aiTitle": title})
             if renamed:
                 recs.append({"type": "custom-title", "customTitle": title})
         p = d / f"{sid}.jsonl"
-        p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        p.write_text("\n".join(json.dumps(r, separators=(",", ":")) for r in recs) + "\n")
         os.utime(p, (NOW - age, NOW - age))
         if kind == "lead":
             t = fake_home / ".claude" / "teams" / "oauth-migration"
@@ -135,8 +148,18 @@ def load_tool():
 
 
 def scrub(out):
+    svg = out.read_text()
     # The demo HOME lives in /tmp; show a normal-looking home instead.
-    out.write_text(out.read_text().replace(str(fake_home), "/home/dev"))
+    svg = svg.replace(str(fake_home), "/home/dev")
+    # Crop away the fake window chrome (title bar, traffic lights, frame) by
+    # pointing the viewBox at the terminal area alone.
+    m = re.search(r'clip-terminal">\s*<rect x="0" y="0" width="([\d.]+)" height="([\d.]+)"', svg)
+    t = re.search(r'<g transform="translate\(([\d.]+), ([\d.]+)\)" clip-path="url\(#[^)]*clip-terminal\)">', svg)
+    if m and t:
+        w, h = float(m[1]), float(m[2])
+        svg = re.sub(r'viewBox="[^"]*"', f'viewBox="{t[1]} {t[2]} {w:.1f} {h:.1f}"', svg, count=1)
+        svg = svg.replace('<svg class="rich-terminal"', f'<svg width="{w:.0f}" height="{h:.0f}" class="rich-terminal"', 1)
+    out.write_text(svg)
     print("wrote", out)
 
 
@@ -186,4 +209,5 @@ async def main():
     shoot_list("plain-list")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

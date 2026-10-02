@@ -368,6 +368,168 @@ def first_prompt(path, max_lines=400):
     return ""
 
 
+COST_MARK = b'"type":"cost-state"'
+
+
+def last_line_with(path, marker, chunk=4 * 1024 * 1024):
+    """(offset just past it, parsed record) of the LAST line containing marker.
+
+    Reads backwards in chunks with no size limit, because a resumed session can
+    leave its newest cost record more than 10 MB from the end of the file.
+    """
+    try:
+        with path.open("rb") as fh:
+            end = fh.seek(0, 2)
+            pos, tail = end, b""
+            while pos > 0:
+                start = max(0, pos - chunk)
+                fh.seek(start)
+                buf = fh.read(pos - start) + tail
+                i = buf.rfind(marker)
+                if i >= 0:
+                    a = buf.rfind(b"\n", 0, i) + 1
+                    b = buf.find(b"\n", i)
+                    b = len(buf) if b < 0 else b
+                    try:
+                        return start + b, json.loads(buf[a:b])
+                    except ValueError:
+                        return None, None
+                # Keep a partial first line so a match split across chunks is found.
+                cut = buf.find(b"\n")
+                tail = buf[:cut] if cut >= 0 else buf
+                pos = start
+    except OSError:
+        pass
+    return None, None
+
+
+def weighted_tokens(u):
+    """Tokens weighted by their price relative to the input price.
+
+    These ratios are Anthropic's published pricing structure: output is 5x the
+    input price, cache reads 0.1x, 5-minute cache writes 1.25x and 1-hour cache
+    writes 2x. The base price itself is never hard-coded; see model_rates().
+    """
+    cc = u.get("cache_creation") or {}
+    w1h = cc.get("ephemeral_1h_input_tokens") or 0
+    w5m = cc.get("ephemeral_5m_input_tokens")
+    if w5m is None:
+        w5m = (u.get("cache_creation_input_tokens") or 0) - w1h
+    return ((u.get("input_tokens") or 0) + 5 * (u.get("output_tokens") or 0)
+            + 0.1 * (u.get("cache_read_input_tokens") or 0) + 1.25 * w5m + 2 * w1h)
+
+
+def usage_by_model(path, after=None, before=None):
+    """Weighted tokens per model from replies timestamped in (after, before].
+
+    Covers the session's own file AND its subagent transcripts, because
+    subagent spend is billed to the parent and included in its cost records.
+    One API response is written as several records sharing a message id, each
+    repeating the same usage, so only the last record per id is counted.
+    """
+    seen = {}
+    files = [path, *(path.parent / path.stem / "subagents").glob("*.jsonl")]
+    for f in files:
+        try:
+            fh = f.open("rb")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if b'"usage"' not in line or b'"assistant"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                ts = rec.get("timestamp") or ""
+                if (after and ts <= after) or (before and ts > before):
+                    continue
+                msg = rec.get("message") or {}
+                if msg.get("usage") and msg.get("model") and msg.get("id"):
+                    seen[msg["id"]] = (msg["model"], weighted_tokens(msg["usage"]))
+    out = {}
+    for model, w in seen.values():
+        out[model] = out.get(model, 0) + w
+    return out
+
+
+def time_before(path, offset, span=256 * 1024):
+    """Timestamp of the last record before a byte offset: when a cost record,
+    which carries no timestamp of its own, was written."""
+    try:
+        with path.open("rb") as fh:
+            start = max(0, offset - span)
+            fh.seek(start)
+            buf = fh.read(offset - start)
+    except OSError:
+        return None
+    for line in reversed(buf.splitlines()):
+        i = line.find(b'"timestamp":"')
+        if i >= 0:
+            return line[i + 13:i + 37].decode("ascii", "replace").split('"')[0]
+    return None
+
+
+def model_rates(want, skip=None, max_files=200):
+    """Price per weighted token for each model in `want`, measured from cost
+    records that Claude Code itself wrote.
+
+    No price table to go stale: a cost-state record carries tokens and dollars
+    per model, so the rate falls out of dividing one by the other. Searches the
+    most recent sessions until every wanted model is covered.
+    """
+    rates = {}
+    files = sorted(STORE.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in files[:max_files]:
+        if not want - rates.keys():
+            break
+        if path == skip:
+            continue
+        _, rec = last_line_with(path, COST_MARK)
+        for model, u in ((rec or {}).get("modelUsage") or {}).items():
+            if model in want and model not in rates and u.get("costUSD"):
+                w = (u.get("inputTokens", 0) + 5 * u.get("outputTokens", 0)
+                     + 0.1 * u.get("cacheReadInputTokens", 0)
+                     + 1.25 * u.get("cacheCreationInputTokens", 0))
+                if w:
+                    rates[model] = u["costUSD"] / w
+    return rates
+
+
+def session_cost(path):
+    """(dollars, exact, lines_added, lines_removed) for a session.
+
+    Claude Code writes a cost-state record only when a session process exits,
+    and its totals carry across resumes. So the newest record is exact up to
+    that exit, and anything after it (a session still running, or one that
+    crashed) is not counted. That remainder is estimated from the usage on each
+    reply, priced at rates measured from real cost records.
+    """
+    off, rec = last_line_with(path, COST_MARK)
+    rec = rec or {}
+    cost = rec.get("totalCostUSD") or 0.0
+    when_written = time_before(path, off) if off else None
+    after = usage_by_model(path, after=when_written)
+    if not after:
+        return cost, True, rec.get("totalLinesAdded"), rec.get("totalLinesRemoved")
+    # Rate from this session's own record first, so its cache mix is matched.
+    rates = {}
+    if off:
+        mine = usage_by_model(path, before=when_written)
+        for model, u in (rec.get("modelUsage") or {}).items():
+            if mine.get(model) and u.get("costUSD"):
+                rates[model] = u["costUSD"] / mine[model]
+    missing = set(after) - rates.keys()
+    if missing:
+        rates.update(model_rates(missing, skip=path))
+    priced = [m for m in after if m in rates]
+    if not priced:
+        return (cost or None), not after, rec.get("totalLinesAdded"), rec.get("totalLinesRemoved")
+    cost += sum(after[m] * rates[m] for m in priced)
+    return cost, False, rec.get("totalLinesAdded"), rec.get("totalLinesRemoved")
+
+
 def find_session(sid):
     for p in STORE.glob(f"*/{sid}.jsonl"):
         return p
@@ -483,12 +645,12 @@ def preview_text(sid, width=80):
     model = got.get("model")
     if model:
         out.append(f"  model            {model}")
-    cost = got.get("totalCostUSD")
+    cost, exact, added, removed = session_cost(path)
     if isinstance(cost, (int, float)) and cost > 0:
-        added, removed = got.get("totalLinesAdded"), got.get("totalLinesRemoved")
-        churn = (f"   +{added:,} / -{removed:,} lines"
-                 if isinstance(added, int) and isinstance(removed, int) else "")
-        out.append(f"  cost             ${cost:,.2f}{churn}")
+        out.append(f"  cost             ${cost:,.2f}" if exact else
+                   f"  cost             ≈ ${cost:,.2f}  (estimated, see README FAQ)")
+    if isinstance(added, int) and isinstance(removed, int) and (added or removed):
+        out.append(f"  lines changed    +{added:,} / -{removed:,}")
     out.append(f"  size             {size_str(st.st_size)}")
     if got.get("teamName"):
         out.append(f"  agent team       teammate in {got['teamName']}")
