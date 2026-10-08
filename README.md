@@ -26,8 +26,8 @@ From inside WSL, hopback also looks in your Windows profile (`/mnt/c/Users/<you>
 - **Harness tabs** (`All · Claude Code · OpenAI Codex · Hermes Agent`), each with a live count; `TAB` cycles them, or click one
 - A **host filter** (`CTRL-O` or click): all hosts, then this one, then Windows, with per-host counts
 - Columns: last active ("3h ago, 2:15 PM", "a day ago, …", then "Sep 4"), **source** (`codex·win`), role, name, directory, size
-- Roles, each with a badge: `lead` and `team` (Claude agent teams), `sub` (subagents), `sdk` (Agent SDK runs), `exec` (`codex exec` runs), `task` (Hermes kanban), `cron` (scheduled runs), `chat` (Hermes chat gateways), `ide` (Codex threads started from an editor)
-- **Agent sessions** are hidden by default (`CTRL-T`), and **scheduled runs** have their own toggle (`CTRL-R`)
+- Roles, each with a badge: `lead` and `team` (Claude agent teams), `sub` (subagents), `sdk` (Agent SDK runs), `exec` (`codex exec` runs), `task` (Hermes kanban), `cron` (scheduled runs), `chat` (Hermes chat gateways), `ide` (Codex threads started from an editor), `copy` and `job` (Claude Code background-job leftovers, see below)
+- **Agent sessions** are hidden by default (`CTRL-T`), **scheduled runs** have their own toggle (`CTRL-R`), and so do **background-job leftovers** (`CTRL-B`)
 - A preview pane with the same shape for every agent: source, directory, git branch, model, cost or tokens, lines changed, the exact **resume command**, the **last prompt**, the **agent's last message** and the **opening prompt**
 - Sessions in `/tmp`, empty sessions and archived sessions are hidden by default
 - If one store can't be read (a schema change, a locked database), the others still load and the problem shows as a red line in the header
@@ -94,6 +94,7 @@ hopback -l                    plain list, no picker (also automatic when piped)
 hopback -n 50 / -a            how many to load per store (default 300) / load all
 hopback -d                    only sessions from the current directory
 hopback -t / -r               include agent sessions / scheduled runs
+hopback -b                    include background-job leftovers (older copies, job scratch runs)
 hopback -s / -e / --archived  include /tmp, empty, archived sessions
 hopback --deep                read whole Claude files (slower, finds early-only titles)
 hopback --id <prefix>         print the full id for a prefix, then exit
@@ -118,6 +119,7 @@ Environment: `HOPBACK_NO_WINDOWS=1` skips the Windows side; `HOPBACK_WINDOWS_HOM
 | `CTRL-O` / click the hosts control | cycle hosts: all, this one, Windows |
 | `CTRL-T` / click | show or hide agent sessions |
 | `CTRL-R` / click | show or hide scheduled runs |
+| `CTRL-B` / click | show or hide background-job leftovers |
 | `CTRL-/` | toggle the preview pane |
 | `CTRL-U` | clear the search |
 | `ESC` | quit |
@@ -158,6 +160,12 @@ Codex records token usage but not dollars, and hopback doesn't guess prices for 
 ### What is "lines changed"?
 
 `+added / -removed` lines from Claude's file edits, taken from the same `cost-state` record. It isn't cost, so it has its own row. It reflects the session as of its last exit and isn't estimated.
+
+### Why did one Claude session show up twice?
+
+If you exit Claude Code while background work is still running (a background agent or shell), Claude Code hands the conversation to a background job under a **new session id**. It copies the history into a new file, and the old file ends with a `continued-in` record that names the new one. hopback marks that old file `copy` and hides it with the other background-job leftovers (`CTRL-B` shows them). The preview pane names the session it continued in.
+
+If the old id is resumed after the hand-over and gets a reply, the two copies have diverged and both hold real work. In that case hopback shows both. Sessions that a background job runs inside its own scratch directory (`~/.claude/jobs/<id>/tmp/...`) are marked `job` and hidden the same way.
 
 ### A Windows session says the agent "is not installed on Windows"
 

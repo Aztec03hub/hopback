@@ -44,7 +44,7 @@ import sys
 import time
 from pathlib import Path
 
-from .adapters import AGENT, BY_NAME, ROLES, SCHEDULED
+from .adapters import AGENT, BY_NAME, LEFTOVER, ROLES, SCHEDULED
 from .fmt import size_str, when
 from .paths import this_host
 from .sources import HOSTS, SRCW, discover
@@ -195,9 +195,11 @@ def haystack(row):
     return f'{row["name"]} {row["cwd"]} {row["id"]} {src.tag} {src.label} {row["role"]}'
 
 
-def keep(row, show_agents, show_scheduled):
+def keep(row, show_agents, show_scheduled, show_leftovers=False):
     role = row.get("role", "")
     if role in AGENT and not show_agents:
+        return False
+    if role in LEFTOVER and not show_leftovers:
         return False
     return not (role in SCHEDULED and not show_scheduled)
 
@@ -207,7 +209,7 @@ def keep(row, show_agents, show_scheduled):
 # --------------------------------------------------------------------------
 
 def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=None,
-              show_agents=False, show_scheduled=False, warnings=()):
+              show_agents=False, show_scheduled=False, show_leftovers=False, warnings=()):
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -310,6 +312,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             Binding("ctrl+y", "resume_yolo", "skip permissions", show=False, priority=True),
             Binding("ctrl+t", "toggle_agents", "agents", show=False, priority=True),
             Binding("ctrl+r", "toggle_scheduled", "scheduled", show=False, priority=True),
+            Binding("ctrl+b", "toggle_leftovers", "background-job leftovers", show=False, priority=True),
             Binding("ctrl+o", "cycle_host", "hosts", show=False, priority=True),
             Binding("tab", "cycle_tab(1)", "next tab", show=False, priority=True),
             Binding("shift+tab", "cycle_tab(-1)", "previous tab", show=False, priority=True),
@@ -331,12 +334,14 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.yolo = yolo
             self.show_agents = show_agents
             self.show_scheduled = show_scheduled
+            self.show_leftovers = show_leftovers
             self.harness = harness   # None = every harness
             self.host = host         # None = every host
             self.result = None
             self._visible = []
             self.toggle_text = ""
             self.sched_text = ""
+            self.left_text = ""
             self.host_text = ""
             self.head_text = ""
             self._hover_idx = None
@@ -355,6 +360,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                     yield Clickable("cycle_host", id="hosts", classes="control")
                     yield Clickable("toggle_agents", id="toggle", classes="control")
                     yield Clickable("toggle_scheduled", id="sched", classes="control")
+                    yield Clickable("toggle_leftovers", id="left", classes="control")
                 yield Static("", id="keys")
                 yield Static("", id="labels", markup=False)
                 yield SessionList(id="list")
@@ -373,7 +379,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 return False
             if not ignore_harness and self.harness and src.adapter.NAME != self.harness:
                 return False
-            return keep(r, self.show_agents, self.show_scheduled)
+            return keep(r, self.show_agents, self.show_scheduled, self.show_leftovers)
 
         def visible_rows(self):
             rs = [r for r in self.all_rows if self.in_scope(r)]
@@ -415,7 +421,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.head_text = f"{shown} sessions"
 
             per_host = {h: sum(1 for r in self.all_rows if r["source"].host == h
-                               and keep(r, self.show_agents, self.show_scheduled)
+                               and keep(r, self.show_agents, self.show_scheduled, self.show_leftovers)
                                and (not self.harness or r["source"].adapter.NAME == self.harness))
                         for h in hosts}
             counts = " · ".join(f"{HOSTS.get(h, h)} {per_host[h]:,}" for h in hosts)
@@ -435,6 +441,12 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             sched = self.query_one("#sched", Static)
             sched.update(self.sched_text)
             sched.set_class(n_sched == 0, "hidden")
+            n_left = hidden(LEFTOVER)
+            self.left_text = (f"[ CTRL-B ] job leftovers "
+                              f"{'shown' if self.show_leftovers else 'hidden'} ({n_left:,})")
+            left = self.query_one("#left", Static)
+            left.update(self.left_text)
+            left.set_class(n_left == 0, "hidden")
 
             def chip(tok, desc):
                 return f"[b #1a1b26 on #7dcfff] {tok} [/][#565f89] {desc}[/]"
@@ -544,6 +556,10 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.show_scheduled = not self.show_scheduled
             self.run_worker(self.refresh_rows(keep_index=False), exclusive=True)
 
+        def action_toggle_leftovers(self):
+            self.show_leftovers = not self.show_leftovers
+            self.run_worker(self.refresh_rows(keep_index=False), exclusive=True)
+
         def action_toggle_preview(self):
             self.query_one("#preview").toggle_class("hidden")
 
@@ -631,6 +647,9 @@ def main():
                     help="include agent sessions: teammates, subagents, SDK/exec runs")
     ap.add_argument("-r", "--scheduled", action="store_true",
                     help="include scheduled (cron) runs")
+    ap.add_argument("-b", "--background", action="store_true",
+                    help="include background-job leftovers: older copies of sessions that "
+                         "moved into a background job, and runs in a job's scratch directory")
     ap.add_argument("--archived", action="store_true", help="include archived sessions")
     ap.add_argument("-l", "--list", action="store_true", help="print a list, no picker")
     ap.add_argument("-y", "--yolo", "--dangerous", dest="yolo", action="store_true",
@@ -696,19 +715,19 @@ def main():
     # hidden unless asked for. The picker loads them regardless, so its
     # toggles can reveal them without a rescan.
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.list
-    load_hidden = interactive or args.teams or args.scheduled
+    load_hidden = interactive or args.teams or args.scheduled or args.background
     rows, total, warnings = load_rows(
         scoped, None if args.all else args.n, args.here, args.deep,
         include_teams=load_hidden, include_scratch=args.scratch, include_empty=args.empty,
         include_archived=args.archived,
-        limit_counts_visible=load_hidden and not (args.teams and args.scheduled))
+        limit_counts_visible=load_hidden and not (args.teams and args.scheduled and args.background))
     for w in warnings:
         print(f"warning: {w}", file=sys.stderr)
     if not rows:
         sys.exit("no sessions found")
 
     if not interactive:
-        rows = [r for r in rows if keep(r, args.teams, args.scheduled)]
+        rows = [r for r in rows if keep(r, args.teams, args.scheduled, args.background)]
         if text:
             rows = rank(rows, text)
         if not rows:
@@ -722,7 +741,8 @@ def main():
 
     chosen, yolo = pick(rows, text, args.yolo, total, args.here, scoped,
                         harness=harness, host=args.host, show_agents=args.teams,
-                        show_scheduled=args.scheduled, warnings=warnings)
+                        show_scheduled=args.scheduled, show_leftovers=args.background,
+                        warnings=warnings)
     if not chosen:
         return
     src = chosen["source"]

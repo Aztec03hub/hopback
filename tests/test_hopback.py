@@ -79,6 +79,40 @@ def test_hidden_categories_are_separate():
     assert {r["role"] for r in with_cron} - {r["role"] for r in plain} == {"cron"}
 
 
+def test_background_job_leftovers():
+    """A session handed to a background job leaves its old file behind with a
+    `continued-in` record. It is a stale copy only if nothing replied after the
+    hand-over; a run inside a job's scratch directory is a leftover too."""
+    import json
+    root = TMP / "jobstore" / ".claude"
+    proj = root / "projects" / "-p"
+    proj.mkdir(parents=True)
+
+    def session(sid, recs, cwd="/home/u/p"):
+        recs = [{"type": "user", "cwd": cwd, "message": {"role": "user", "content": "hi"}},
+                {"type": "assistant", "cwd": cwd, "message": {"role": "assistant", "content": "ok"}}] + recs
+        (proj / f"{sid}.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in recs))
+
+    hand_over = {"type": "continued-in", "continuedInSessionId": "new"}
+    note = {"type": "user", "message": {"role": "user", "content": "<task-notification>"}}
+    reply = {"type": "assistant", "message": {"role": "assistant", "content": "back again"}}
+    session("new", [])
+    session("stale", [hand_over, note])            # only a notification after: stale
+    session("diverged", [hand_over, note, reply])  # resumed later: both are real
+    session("dangling", [{"type": "continued-in", "continuedInSessionId": "gone"}])
+    session("scratch", [], cwd="/home/u/.claude/jobs/06f5ccaf/tmp/tuitest")
+    rows, _ = claude.collect(root, None, False, False, include_empty=True)
+    roles = {r["id"]: r["role"] for r in rows}
+    assert roles == {"new": "", "stale": "copy", "diverged": "", "dangling": "", "scratch": "job"}, roles
+    shown = {r["id"] for r in rows if cli.keep(r, False, False)}
+    assert shown == {"new", "diverged", "dangling"}, shown
+    assert {r["id"] for r in rows if cli.keep(r, False, False, True)} == set(roles)
+    fields = dict(claude.details(root, "stale")["fields"])
+    assert fields["continued in"].startswith("new ")
+    assert "continued in" not in dict(claude.details(root, "dangling")["fields"])
+    assert not claude.is_job_scratch("/home/u/.claude/jobs/06f5ccaf")
+
+
 def test_previews_read_real_messages():
     p = cli.preview(row(IDS["codex-cli-user"]), 100)
     assert "Also cover the empty-page case" in p, p

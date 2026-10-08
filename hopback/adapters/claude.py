@@ -4,6 +4,7 @@ Every function takes the store ROOT (the .claude directory) rather than reading
 a global, so one process can read several Claude stores, e.g. WSL and Windows.
 """
 import json
+import re
 import time
 from pathlib import Path
 
@@ -59,6 +60,8 @@ def scan(path, whole_file=False, want_prompt=False):
         # window. List mode stays small because it does this per file.
         text = tail_text(path, nbytes=4 * 1024 * 1024 if want_prompt else TAIL_BYTES)
     out = {}
+    if target := continued_into(text):
+        out["continuedIn"] = target
     for line in reversed(text.splitlines()):
         if not line.startswith("{"):
             continue
@@ -271,6 +274,38 @@ def is_scratch(cwd):
     return cwd == "/tmp" or cwd.startswith("/tmp/")
 
 
+def is_job_scratch(cwd):
+    """Sessions run inside a background job's scratch directory,
+    ~/.claude/jobs/<id>/tmp/..., which a job uses for its own throwaway tests."""
+    return re.search(r"/\.claude/jobs/[^/]+/tmp(/|$)", (cwd or "").replace("\\", "/")) is not None
+
+
+def continued_into(text):
+    """The session this one was handed over to, if it ended there.
+
+    Exiting while background work still runs turns a session into a background
+    job under a NEW id: the history is copied into a new file and the old one
+    gets a `continued-in` record naming it. That old file is then a stale copy.
+    It is only stale if no reply came after the hand-over; a later assistant
+    record means the old id was resumed and the two have since diverged.
+    Notifications may still land as user records after it, so those don't count.
+    """
+    if '"continued-in"' not in text:
+        return None
+    target = None
+    for line in text.splitlines():
+        if '"continued-in"' in line:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("type") == "continued-in":
+                target = rec.get("continuedInSessionId")
+        elif target and '"type":"assistant"' in line:
+            target = None
+    return target
+
+
 def first_prompt(path, max_lines=400):
     """The opening user message, read from the HEAD of the file.
 
@@ -480,6 +515,7 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
     files = sorted((root / "projects").glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     here = str(Path.cwd().resolve())
     leads = team_leads(root)
+    sids = {p.stem for p in files}
     rows = []
     counted = 0
     for path in files:
@@ -511,14 +547,18 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
             role, team_info = "sdk", f"launched via {entrypoint}"
         elif sid in leads:
             role, team_info = "lead", f"{leads[sid][0]} ({leads[sid][1]} members)"
+        elif got.get("continuedIn") in sids:
+            role, team_info = "copy", f"continued in {got['continuedIn']}"
+        elif is_job_scratch(cwd):
+            role, team_info = "job", "run inside a background job's scratch directory"
         else:
             role, team_info = "", ""
         # Filter here rather than after, so -n counts rows you actually see.
-        if not include_teams and role == "team":
+        if not include_teams and role in ("team", "copy", "job"):
             continue
         if not include_scratch and is_scratch(cwd):
             continue
-        if not limit_counts_visible or role not in ("team", "sdk"):
+        if not limit_counts_visible or role not in ("team", "sdk", "copy", "job"):
             counted += 1
         rows.append({
             "mtime": st.st_mtime,
@@ -571,6 +611,8 @@ def details(root, sid):
         if sid in leads:
             nm, n = leads[sid]
             fields.append(("agent team", f"LEAD of {nm}, {n} members"))
+    if got.get("continuedIn") and find_session(root, got["continuedIn"]):
+        fields.append(("continued in", f"{got['continuedIn']}  (this file is the older copy)"))
     by_role = last_by_role(path)
     return {
         "title": (got.get("customTitle") or got.get("aiTitle")

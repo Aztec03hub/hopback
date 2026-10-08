@@ -19,7 +19,8 @@ from . import claude, codex, hermes
 ADAPTERS = [claude, codex, hermes]
 BY_NAME = {a.NAME: a for a in ADAPTERS}
 
-# Badge -> legend text. AGENT roles hide behind CTRL-T, SCHEDULED behind CTRL-R.
+# Badge -> legend text. AGENT roles hide behind CTRL-T, SCHEDULED behind CTRL-R,
+# LEFTOVER behind CTRL-B.
 ROLES = {
     "lead": "led an agent team",
     "team": "was a teammate",
@@ -30,6 +31,9 @@ ROLES = {
     "cron": "scheduled run",
     "chat": "chat gateway",
     "ide": "started in an editor",
+    "copy": "older copy of a session that moved",
+    "job": "background-job scratch run",
 }
 AGENT = {"team", "sub", "sdk", "exec", "task"}
 SCHEDULED = {"cron"}
+LEFTOVER = {"copy", "job"}
