@@ -4,6 +4,7 @@ Every function takes the store ROOT (the .claude directory) rather than reading
 a global, so one process can read several Claude stores, e.g. WSL and Windows.
 """
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -403,29 +404,55 @@ def time_before(path, offset, span=256 * 1024):
     return None
 
 
+_RATES = {}  # store -> [(path, {model: rate}), ...], newest file first
+_RATES_LOCK = threading.Lock()
+
+
+def _file_rates(store, max_files):
+    """Each recent file's per-model rates, read once per store per process.
+
+    Finding a rate means reading files backwards until a cost record turns up,
+    which for a store full of unexited sessions is hundreds of megabytes. That
+    is far too slow to repeat on every preview, so the scan is kept, misses
+    included.
+    """
+    with _RATES_LOCK:
+        if store not in _RATES:
+            files = sorted(store.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime,
+                           reverse=True)
+            found = []
+            for path in files[:max_files]:
+                _, rec = last_line_with(path, COST_MARK)
+                rates = {}
+                for model, u in ((rec or {}).get("modelUsage") or {}).items():
+                    w = (u.get("inputTokens", 0) + 5 * u.get("outputTokens", 0)
+                         + 0.1 * u.get("cacheReadInputTokens", 0)
+                         + 1.25 * u.get("cacheCreationInputTokens", 0))
+                    if w and u.get("costUSD"):
+                        rates[model] = u["costUSD"] / w
+                if rates:
+                    found.append((path, rates))
+            _RATES[store] = found
+        return _RATES[store]
+
+
 def model_rates(want, store, skip=None, max_files=200):
     """Price per weighted token for each model in `want`, measured from cost
     records that Claude Code itself wrote.
 
     No price table to go stale: a cost-state record carries tokens and dollars
-    per model, so the rate falls out of dividing one by the other. Searches the
-    most recent sessions until every wanted model is covered.
+    per model, so the rate falls out of dividing one by the other. Takes each
+    model's rate from the most recent session that has one.
     """
     rates = {}
-    files = sorted(store.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in files[:max_files]:
+    for path, found in _file_rates(store, max_files):
         if not want - rates.keys():
             break
         if path == skip:
             continue
-        _, rec = last_line_with(path, COST_MARK)
-        for model, u in ((rec or {}).get("modelUsage") or {}).items():
-            if model in want and model not in rates and u.get("costUSD"):
-                w = (u.get("inputTokens", 0) + 5 * u.get("outputTokens", 0)
-                     + 0.1 * u.get("cacheReadInputTokens", 0)
-                     + 1.25 * u.get("cacheCreationInputTokens", 0))
-                if w:
-                    rates[model] = u["costUSD"] / w
+        for model, rate in found.items():
+            if model in want and model not in rates:
+                rates[model] = rate
     return rates
 
 

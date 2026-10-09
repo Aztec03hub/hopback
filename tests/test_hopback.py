@@ -210,6 +210,107 @@ def test_picker_controls():
     asyncio.run(drive())
 
 
+def test_preview_cache_round_trips_and_notices_changes():
+    from hopback import previewcache
+    r = dict(row(IDS["claude-lead"]))
+    path = TMP / "cache" / "previews.json"
+    pv = previewcache.Previewer(path=path)
+    assert pv.get(r) is None
+    d = pv.get_now(r)
+    assert "LEAD of oauth-migration" in cli.render_preview(r, d, 100)
+    pv.save()
+    warm = previewcache.Previewer(path=path)
+    assert warm.get(r) == d                  # a new run starts warm
+    r["mtime"] += 1
+    assert warm.get(r) is None               # a changed session is read again
+
+
+def test_model_rates_scans_a_store_once():
+    store = HOME / ".claude" / "projects"
+    claude._RATES.clear()
+    calls = []
+    real = claude.last_line_with
+    claude.last_line_with = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        claude.model_rates({"no-such-model"}, store)
+        first = len(calls)
+        claude.model_rates({"no-such-model"}, store)
+        claude.model_rates({"another-missing-model"}, store)
+    finally:
+        claude.last_line_with = real
+    assert first and len(calls) == first, (first, len(calls))
+
+
+def test_cursor_moves_never_read_sessions_on_the_ui_thread():
+    import threading
+    from hopback import previewcache
+    rows, total = load()
+    ui = []
+    real = previewcache.build
+
+    def spy(r):
+        ui.append(threading.current_thread() is threading.main_thread())
+        return real(r)
+
+    async def drive():
+        pv = previewcache.Previewer(persist=False)
+        app = cli.build_app(rows, "", False, total, False, discover(), previewer=pv)
+        async with app.run_test(size=(150, 50)) as p:
+            for _ in range(8):
+                await p.press("down")
+            await p.press("up")
+            for _ in range(100):           # let the background thread catch up
+                await p.pause(0.02)
+                if all(pv.get(r) for r in app._visible):
+                    break
+            assert all(pv.get(r) for r in app._visible), "prefetch did not finish"
+            await p.pause(0.05)
+            body = str(app.query_one("#preview_body").render())
+            assert "reading…" not in body and "resume" in body, body
+
+    previewcache.build = spy
+    try:
+        asyncio.run(drive())
+    finally:
+        previewcache.build = real
+    assert ui and not any(ui), "details() ran on the UI thread"
+
+
+def test_session_list_keeps_cursor_visible_and_wheel_moves_it():
+    rows, total = load()
+
+    async def drive():
+        app = cli.build_app(rows, "", False, total, False, discover())
+        async with app.run_test(size=(150, 30)) as p:   # short: rows overflow
+            lv = app.query_one("#list")
+            await p.pause()
+            n = len(app._visible)
+            assert n > lv.scrollable_content_region.height, "test needs overflow"
+            for _ in range(n + 3):
+                await p.press("down")
+            await p.pause()
+            assert lv.index == n - 1                     # clamped at the end
+            top = int(lv.scroll_offset.y)
+            assert top <= lv.index < top + lv.scrollable_content_region.height
+            await p.press("pageup")
+            assert lv.index == n - 11
+            class Wheel:   # Pilot has no wheel; the handler only needs these
+                def prevent_default(self): pass
+                def stop(self): pass
+            lv.on_mouse_scroll_up(Wheel())
+            await p.pause()
+            assert lv.index == n - 12                    # wheel moves the selection
+            lv.index = 0
+            await p.pause()
+            assert int(lv.scroll_offset.y) == 0
+            await p.click("#list", offset=(5, 2))
+            await p.pause()
+        return app
+
+    app = asyncio.run(drive())
+    assert app.result and app.result[0] is app._visible[2], "click did not resume row 2"
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):

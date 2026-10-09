@@ -44,6 +44,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import previewcache
 from .adapters import AGENT, BY_NAME, ROLES, SCHEDULED
 from .fmt import size_str, when
 from .paths import this_host
@@ -93,13 +94,19 @@ def wrap_into(out, text, width, limit=None):
 
 def preview(row, width=80):
     """The preview pane for one row, the same shape for every harness."""
+    return render_preview(row, previewcache.build(row), width)
+
+
+def loading_preview(row):
+    """Shown for the instant before a row's details are built."""
+    return f"{row['name']}\n\n  {'source':<16} {row['source'].tag}\n  reading…"
+
+
+def render_preview(row, d, width=80):
+    """Lay out details already read by previewcache.build()."""
     src = row["source"]
-    try:
-        d = src.adapter.details(src.root, row["id"])
-    except Exception as exc:  # noqa: BLE001
-        return f"could not read this session: {exc.__class__.__name__}: {exc}"
-    if d is None:
-        return "session not found in its store (deleted since the list loaded?)"
+    if "error" in d:
+        return d["error"]
     title = d["title"] if len(d["title"]) <= 200 else d["title"][:199] + "…"
     out = [f"{title}\n", f"  {'source':<16} {src.tag}  ({src.label})"]
     out += [f"  {label:<16} {value}" for label, value in d["fields"]]
@@ -207,43 +214,128 @@ def keep(row, show_agents, show_scheduled):
 # --------------------------------------------------------------------------
 
 def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=None,
-              show_agents=False, show_scheduled=False, warnings=()):
+              show_agents=False, show_scheduled=False, warnings=(), previewer=None):
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
-    from textual.widgets import Input, ListItem, ListView, Static, Tab, Tabs
+    from rich.segment import Segment
+    from rich.style import Style
+    from textual.geometry import Size
+    from textual.message import Message
+    from textual.scroll_view import ScrollView
+    from textual.strip import Strip
+    from textual.widgets import Input, Static, Tab, Tabs
+
+    ROW_STYLE = Style(bgcolor="#16161e", color="#a9b1d6")
+    ROW_ALT = Style(bgcolor="#262b3d", color="#a9b1d6")
+    ROW_HOVER = Style(bgcolor="#343b58", color="#c0caf5")
+    ROW_HIGHLIGHT = Style(bgcolor="#3b4261", color="#ffc896", bold=True)
 
     harnesses = [a for a in BY_NAME if any(s.adapter.NAME == a for s in sources)]
     hosts = sorted({s.host for s in sources}, key=lambda h: (h != this_host(), h))
 
-    class SessionList(ListView):
-        """ListView whose wheel changes the SELECTION rather than the viewport.
+    class SessionList(ScrollView):
+        """The session rows, painted line by line.
 
-        Scrolling the viewport under a stationary cursor means the highlighted
-        row silently becomes one you are not pointing at; moving the selection
-        keeps the wheel and the highlight talking about the same thing.
+        One widget per row (ListView) re-styles and re-lays-out every row on
+        each cursor move, tens of milliseconds even for a hundred rows, so a
+        spun wheel queues up and the list trails behind it. Painting only the
+        visible lines keeps a move to a couple of milliseconds at any length.
+
+        The wheel changes the SELECTION rather than the viewport: scrolling
+        under a stationary cursor means the highlighted row silently becomes
+        one you are not pointing at.
         """
+
+        class Highlighted(Message):
+            pass
+
+        class Selected(Message):
+            pass
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.lines = []
+            self._index = None
+            self.hover = None
+
+        @property
+        def index(self):
+            return self._index
+
+        @index.setter
+        def index(self, value):
+            if not self.lines:
+                value = None
+            elif value is not None:
+                value = max(0, min(value, len(self.lines) - 1))
+            if value == self._index:
+                return
+            self._index = value
+            if value is not None:
+                top, h = int(self.scroll_offset.y), max(1, self.scrollable_content_region.height)
+                if value < top:
+                    self.scroll_to(y=value, animate=False, immediate=True)
+                elif value >= top + h:
+                    self.scroll_to(y=value - h + 1, animate=False, immediate=True)
+            self.refresh()
+            self.post_message(self.Highlighted())
+
+        def set_lines(self, lines, index):
+            self.lines = lines
+            self.hover = None
+            self._index = None
+            self.virtual_size = Size(0, len(lines))
+            self.scroll_to(y=0, animate=False, immediate=True)
+            self.index = index if lines else None
+            self.refresh()
+
+        def render_line(self, y):
+            width = self.scrollable_content_region.width
+            idx = y + int(self.scroll_offset.y)
+            if idx >= len(self.lines):
+                return Strip.blank(width, ROW_STYLE)
+            if idx == self._index:
+                style = ROW_HIGHLIGHT
+            elif idx == self.hover:
+                style = ROW_HOVER
+            else:
+                style = ROW_ALT if idx % 2 else ROW_STYLE
+            return Strip([Segment(" " + self.lines[idx], style)]).crop_extend(0, width, style)
+
+        def move(self, step):
+            self.index = 0 if self._index is None else self._index + step
+
+        def _row_at(self, event):
+            idx = event.y + int(self.scroll_offset.y)
+            return idx if 0 <= idx < len(self.lines) else None
 
         def on_mouse_scroll_down(self, event):
             event.prevent_default()
             event.stop()
-            self.action_cursor_down()
+            self.move(1)
 
         def on_mouse_scroll_up(self, event):
             event.prevent_default()
             event.stop()
-            self.action_cursor_up()
+            self.move(-1)
 
-    class Row(ListItem):
-        """One session. Carries its own alternation class so the CSS cascade,
-        not the text, decides its colour; that is what lets the focus and hover
-        rules override the stripe, which ANSI in fzf could never do."""
+        def on_mouse_move(self, event):
+            idx = self._row_at(event)
+            if idx != self.hover:
+                self.hover = idx
+                self.refresh()
 
-        def __init__(self, row, text, alt):
-            super().__init__(Static(text, markup=False))
-            self.row = row
-            if alt:
-                self.add_class("alt")
+        def on_leave(self, event):
+            if self.hover is not None:
+                self.hover = None
+                self.refresh()
+
+        def on_click(self, event):
+            idx = self._row_at(event)
+            if idx is not None:
+                self.index = idx
+                self.post_message(self.Selected())
 
     class Clickable(Static):
         """A one-line control that runs an app action when clicked."""
@@ -277,22 +369,9 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
         #controls { height: 1; padding-left: 2; }
         #keys { height: auto; }
         #labels { color: #7dcfff; height: 1; }
-        #list { background: #16161e; height: 1fr; scrollbar-size-vertical: 1; }
-        #list > ListItem { background: #16161e; color: #a9b1d6; padding: 0 1; }
-        /* Alternating rows. A later, equally specific rule still loses to the
-           more specific state selectors below, which is the whole point. */
-        #list > ListItem.alt { background: #262b3d; }
-        #list > ListItem.hovered,
-        #list > ListItem.-hovered,
-        #list > ListItem.alt.hovered,
-        #list > ListItem.alt.-hovered { background: #343b58; color: #c0caf5; }
-        #list > ListItem.-highlight,
-        #list > ListItem.alt.-highlight,
-        #list > ListItem.hovered.-highlight,
-        #list > ListItem.-hovered.-highlight,
-        #list > ListItem.alt.hovered.-highlight,
-        #list > ListItem.alt.-hovered.-highlight {
-            background: #3b4261; color: #ffc896; text-style: bold;
+        #list {
+            background: #16161e; height: 1fr; overflow-x: hidden;
+            scrollbar-size-vertical: 1;
         }
         #preview {
             height: 45%; border-top: solid #3a3a4a; background: #16161e;
@@ -339,7 +418,8 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.sched_text = ""
             self.host_text = ""
             self.head_text = ""
-            self._hover_idx = None
+            self.previewer = previewer or previewcache.Previewer()
+            self._shown = None   # what the preview pane currently shows
 
         def compose(self) -> ComposeResult:
             with Vertical(id="frame") as frame:
@@ -362,6 +442,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                     yield Static("", id="preview_body", markup=False)
 
         async def on_mount(self):
+            self.previewer.start(self._preview_ready)
             await self.refresh_rows()
             self.query_one("#search", Input).focus()
 
@@ -382,20 +463,15 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             return rs
 
         async def refresh_rows(self, keep_index=True):
-            lv = self.query_one("#list", ListView)
+            lv = self.query_one("#list", SessionList)
             prev = lv.index if keep_index else 0
             self._visible = self.visible_rows()
             home = str(Path.home())
             now = time.time()
             namew = min(max((len(r["name"]) for r in self._visible), default=4), 34)
-            self._hover_idx = None
-            await lv.clear()
-            items = [Row(r, fmt(r, namew, home, now), i % 2 == 1)
-                     for i, r in enumerate(self._visible)]
-            if items:
-                await lv.extend(items)
-                lv.index = min(prev or 0, len(items) - 1)
+            lv.set_lines([fmt(r, namew, home, now) for r in self._visible], prev or 0)
             self.update_header(namew)
+            self.previewer.set_rows(self._visible)
             self.update_preview()
 
         def update_header(self, namew):
@@ -448,13 +524,31 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.query_one("#labels", Static).update("  " + header(namew))
 
         def update_preview(self):
+            """Show the highlighted row's preview. Never reads a session here:
+            details come from the background previewer, and until they arrive
+            the pane shows a one-line placeholder, so moving the cursor stays
+            instant however slow a session is to read."""
             pane = self.query_one("#preview_body", Static)
-            lv = self.query_one("#list", ListView)
+            lv = self.query_one("#list", SessionList)
             if not self._visible or lv.index is None:
+                self._shown = None
                 pane.update("")
                 return
-            row = self._visible[min(lv.index, len(self._visible) - 1)]
-            pane.update(preview(row, max(40, self.size.width - 6)))
+            idx = min(lv.index, len(self._visible) - 1)
+            row = self._visible[idx]
+            self.previewer.want(row, idx)
+            d = self.previewer.get(row)
+            width = max(40, self.size.width - 6)
+            shown = (previewcache.key(row), previewcache.stamp(row), width, d is not None)
+            if shown == self._shown:
+                return
+            self._shown = shown
+            pane.update(loading_preview(row) if d is None else render_preview(row, d, width))
+            self.query_one("#preview").scroll_home(animate=False)
+
+        def _preview_ready(self, row):
+            # Called from the previewer thread.
+            self.call_from_thread(self.update_preview)
 
         # -- events ----------------------------------------------------------
         def on_input_submitted(self, event):
@@ -475,52 +569,24 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 self.harness = want
                 self.run_worker(self.refresh_rows(keep_index=False), exclusive=True)
 
-        def on_list_view_highlighted(self, event):
+        def on_session_list_highlighted(self, event):
             self.update_preview()
 
-        def on_list_view_selected(self, event):
+        def on_session_list_selected(self, event):
             self.action_resume()
-
-        def on_mouse_move(self, event):
-            """Hover highlighting for rows.
-
-            ListView absorbs pointer events, so neither :hover nor Enter/Leave
-            ever reaches a row. Screen coordinates are mapped to a row index
-            instead: rows are one line tall, so the arithmetic is exact.
-            """
-            lv = self.query_one("#list", ListView)
-            region = lv.content_region
-            kids = list(lv.children)
-            idx = None
-            if (region.x <= event.screen_x < region.x + region.width
-                    and region.y <= event.screen_y < region.y + region.height):
-                idx = event.screen_y - region.y + int(lv.scroll_offset.y)
-                if not (0 <= idx < len(kids)):
-                    idx = None
-            if idx == self._hover_idx:
-                return
-            if self._hover_idx is not None and self._hover_idx < len(kids):
-                kids[self._hover_idx].remove_class("hovered")
-            self._hover_idx = idx
-            if idx is not None:
-                kids[idx].add_class("hovered")
 
         # -- actions ---------------------------------------------------------
         def action_cursor_down(self):
-            self.query_one("#list", ListView).action_cursor_down()
+            self.query_one("#list", SessionList).move(1)
 
         def action_cursor_up(self):
-            self.query_one("#list", ListView).action_cursor_up()
+            self.query_one("#list", SessionList).move(-1)
 
         def action_page_down(self):
-            lv = self.query_one("#list", ListView)
-            for _ in range(10):
-                lv.action_cursor_down()
+            self.query_one("#list", SessionList).move(10)
 
         def action_page_up(self):
-            lv = self.query_one("#list", ListView)
-            for _ in range(10):
-                lv.action_cursor_up()
+            self.query_one("#list", SessionList).move(-10)
 
         def action_clear_query(self):
             self.query_one("#search", Input).value = ""
@@ -548,7 +614,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.query_one("#preview").toggle_class("hidden")
 
         def action_resume(self, yolo=False):
-            lv = self.query_one("#list", ListView)
+            lv = self.query_one("#list", SessionList)
             if not self._visible or lv.index is None:
                 return
             self.result = (self._visible[min(lv.index, len(self._visible) - 1)],
@@ -561,6 +627,10 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
         def action_quit_none(self):
             self.result = None
             self.exit()
+
+        def on_unmount(self):
+            self.previewer.stop()
+            self.previewer.save()
 
     return SessionPicker()
 
