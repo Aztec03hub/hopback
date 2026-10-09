@@ -1,5 +1,23 @@
 """Display helpers shared by the picker and the adapters."""
+import re
 import time
+
+# Untrusted text (a session's title, reply or directory, a store's error) must
+# not reach a terminal as an escape sequence. C0 and C1 controls, DEL, the line
+# and paragraph separators and the bidi controls (a U+202E title can display as
+# something else than it is) become a space. ZWJ and variation selectors stay:
+# emoji need them. Multi-line text keeps its newlines and tabs.
+_BAD = ("\x00-\x08\x0b-\x1f\x7f-\x9f  ‎‏؜"
+        "‪-‮⁦-⁩")
+CONTROL = re.compile(f"[{_BAD}]")
+CONTROL_LINE = re.compile(f"[\x09\x0a{_BAD}]")
+HARD_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")   # what no real path contains
+
+
+def safe_text(text, line=False):
+    """`text` with control characters replaced by a space (a line of the list
+    also loses its newlines and tabs)."""
+    return (CONTROL_LINE if line else CONTROL).sub(" ", text)
 
 
 def size_str(nbytes):

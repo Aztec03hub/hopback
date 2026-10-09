@@ -13,6 +13,7 @@ from pathlib import Path
 from types import ModuleType
 
 from .adapters import ADAPTERS
+from .fmt import HARD_CONTROL
 from .paths import is_win_path, powershell, ps_quote, this_host, to_local, windows_home
 
 SAFE_ID = re.compile(r"[\w.:-]+")
@@ -58,6 +59,13 @@ class Source:
         # rather than passed to a shell or to PowerShell.
         if not SAFE_ID.fullmatch(row["id"]):
             raise RuntimeError(f"refusing to resume an unusual session id: {row['id']!r}")
+        # A control character in a directory would reach a terminal as an escape
+        # sequence in the printed command (--print-cd), and no real directory
+        # has one. Refuse rather than alter the path: a changed path would cd
+        # somewhere else. (Bidi marks stay: a Hebrew directory name is real, and
+        # the quoted command round-trips it exactly.)
+        if HARD_CONTROL.search(cwd or ""):
+            raise RuntimeError(f"refusing to resume in a directory with control characters: {cwd!r}")
         if self.host == "win" and this_host() == "wsl":
             ps = powershell()
             if not ps:

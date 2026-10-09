@@ -13,8 +13,9 @@ through PowerShell, in its Windows directory.
 The UI is Textual rather than fzf. fzf applies its focus colours only where the
 row text does not already set its own, so alternating row colours and a uniform
 focused row are mutually exclusive there, and it has no mouse-motion events at
-all so nothing can highlight on hover. Textual's CSS cascade lets the focus rule
-override the stripe rule, and gives real :hover.
+all so nothing can highlight on hover. Textual paints the rows itself (a
+ScrollView, SessionList, that draws only the visible lines): the stripes, the
+uniform focused row and the hover colour are all set in render_line.
 
 Usage:
     hopback                       every session, every harness, every host
@@ -53,7 +54,7 @@ import time
 from pathlib import Path
 
 from .adapters import AGENT, BY_NAME, LEFTOVER, ROLES, SCHEDULED, claude
-from .fmt import size_str, when
+from .fmt import safe_text, size_str, when
 from .paths import this_host
 from .sources import HOSTS, SRCW, discover
 
@@ -102,15 +103,9 @@ def wrap_into(out, text, width, limit=None):
             out.append("  " + line)
 
 
-# Terminal control characters: a session's title or reply is untrusted text, and an escape
-# sequence in it must not reach the terminal. The pane keeps newlines and tabs.
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-_CONTROL_LINE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-
-
-def safe_text(text, line=False):
-    """`text` with control characters replaced by a space (a line of the list also loses \\n and \\t)."""
-    return (_CONTROL_LINE if line else _CONTROL).sub(" ", text)
+def show(widget, text):
+    """The one way text derived from a session or a store reaches a widget."""
+    widget.update(safe_text(text))
 
 
 def preview(row, width=80):
@@ -206,7 +201,7 @@ def plain(rows, total, sources):
     namew = min(max((len(r["name"]) for r in rows), default=4), 40)
     print(header(namew) + "  ID")
     for r in rows:
-        print(fmt(r, namew, home, now) + f'  {r["id"]}')
+        print(safe_text(fmt(r, namew, home, now) + f'  {r["id"]}', line=True))
     print(f'\n{len(rows)} shown, {total} sessions in {len(sources)} stores'
           f'   · = named by you, ? = directory not recorded or inferred', file=sys.stderr)
     print("resume one:  hopback --print-cd <id or words>   (or run hopback for the picker)",
@@ -400,12 +395,21 @@ def _exit_with_parent(parent):
 
 
 def _pool_init(parent, stores):
-    """Each worker watches its parent, then reads the cost rates of every store
-    once (the scan is per process, and would otherwise cost the first preview
-    a second or two in each worker)."""
+    """Each worker watches its parent and, on a daemon thread, reads the cost
+    rates of every store once (the scan is per process, and would otherwise
+    cost the first preview that needs a rate a second or two). It is a thread
+    so the worker takes jobs at once: a preview that needs no rate does not
+    wait, and one that does waits on the scan's lock rather than scanning
+    again. Returns the thread (the pool ignores it)."""
+    import threading
     _exit_with_parent(parent)
-    for store in stores:
-        claude.warm_rates(Path(store))
+
+    def warm():
+        for store in stores:
+            claude.warm_rates(Path(store))
+    thread = threading.Thread(target=warm, name="hopback-warm-rates", daemon=True)
+    thread.start()
+    return thread
 
 
 def preview_pool(stores=()):
@@ -495,18 +499,23 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 top, h = int(self.scroll_offset.y), max(1, self.scrollable_content_region.height)
                 if value < top:
                     self.scroll_to(y=value, animate=False, immediate=True)
+                    self.hover = None      # the pointer is over another row now
                 elif value >= top + h:
                     self.scroll_to(y=value - h + 1, animate=False, immediate=True)
+                    self.hover = None      # (the next mouse move sets it again)
             self.refresh()
             self.post_message(self.Highlighted())
 
-        def set_lines(self, lines, index):
-            """Replace every row; the cursor lands on `index` (clamped)."""
+        def set_lines(self, lines, index, keep_scroll=False):
+            """Replace every row; the cursor lands on `index` (clamped). With
+            `keep_scroll` the viewport stays where it was (as far as the new
+            length allows) instead of going back to the top."""
+            top = int(self.scroll_offset.y)
             self.lines = [safe_text(t, line=True) for t in lines]
             self.hover = None
             self._index = None
             self.virtual_size = Size(0, len(lines))
-            self.scroll_to(y=0, animate=False, immediate=True)
+            self.scroll_to(y=top if keep_scroll else 0, animate=False, immediate=True)
             self.index = index if lines else None
             self.refresh()
 
@@ -703,7 +712,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                     yield Clickable("show_review", id="reviewtab",
                                     classes="" if start_review else "hidden")
                 yield Static("", id="head", markup=False)
-                yield Static("\n".join(warnings), id="warn", markup=False,
+                yield Static(safe_text("\n".join(warnings)), id="warn", markup=False,
                              classes="" if warnings else "hidden")
                 with Horizontal(id="controls", classes="controls"):
                     yield Clickable("cycle_host", id="hosts", classes="control")
@@ -796,7 +805,8 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 if self.view_review:
                     namew += 4                     # room for the "[x] " mark fmt() puts in the column
                 self._namew = namew
-                lv.set_lines([fmt(r, namew, home, now) for r in self._visible], prev or 0)
+                lv.set_lines([fmt(r, namew, home, now) for r in self._visible], prev or 0,
+                             keep_scroll=keep_index)
                 self._shown_ticket = ticket
                 self.update_header(namew)
                 self.update_preview()
@@ -920,13 +930,13 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self._preview_key = key
             cached = self._previews.get(key)
             if cached:
-                pane.update(cached[1])
+                show(pane, cached[1])
                 # A live session keeps growing: show what we have at once, and
                 # re-read it in the background if that is more than 10 s old.
                 if time.time() - cached[0] < 10:
                     return
             else:
-                pane.update(f"{row['name']}\n\n  loading…")
+                show(pane, f"{row['name']}\n\n  loading…")
             # Debounce: holding an arrow key fires one read for the row it
             # stops on, not one per row passed. exclusive: moving on cancels a
             # read that hasn't started, so the row you stop on isn't queued
@@ -950,13 +960,13 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                     text = await loop.run_in_executor(None, preview, row, width)
                 except Exception as exc:  # noqa: BLE001
                     if key == self._preview_key:
-                        self.query_one("#preview_body", Static).update(
-                            safe_text(f"could not read this session: {exc.__class__.__name__}: {exc}"))
+                        show(self.query_one("#preview_body", Static),
+                             f"could not read this session: {exc.__class__.__name__}: {exc}")
                     return      # not cached: the next visit tries again
             except Exception as exc:  # noqa: BLE001
                 text = safe_text(f"could not read this session: {exc.__class__.__name__}: {exc}")
                 if key == self._preview_key:
-                    self.query_one("#preview_body", Static).update(text)
+                    show(self.query_one("#preview_body", Static), text)
                 return          # not cached: the next visit tries again
             self.show_preview(key, text)
 
@@ -965,7 +975,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 self._previews.clear()
             self._previews[key] = (time.time(), text)
             if key == self._preview_key:
-                self.query_one("#preview_body", Static).update(text)
+                show(self.query_one("#preview_body", Static), text)
 
         # -- events ----------------------------------------------------------
         def on_input_submitted(self, event):
@@ -1068,7 +1078,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self._review_loading = False
             self.review_rows = rows
             for p in problems:
-                self.notify(p, severity="error", timeout=30)
+                self.notify(safe_text(p), severity="error", timeout=30)
             if self.view_review:
                 self.run_worker(self.refresh_rows(keep_index=False))
 
@@ -1138,7 +1148,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
         def report_state(self):
             """Show (once) what went wrong reading saved state."""
             while STATE_PROBLEMS:
-                self.notify(STATE_PROBLEMS.pop(0), severity="warning", timeout=30)
+                self.notify(safe_text(STATE_PROBLEMS.pop(0)), severity="warning", timeout=30)
 
         def action_show_hidden(self):
             if self.view_hidden:
@@ -1336,8 +1346,8 @@ def main():
                 hits += [(src, i) for i in src.adapter.ids(src.root)
                          if i == want or (args.id and i.startswith(want))]
             except Exception as exc:  # noqa: BLE001 - one bad store mustn't hide the others
-                print(f"{src.tag}: could not read {src.root} ({exc.__class__.__name__}: {exc})",
-                      file=sys.stderr)
+                print(safe_text(f"{src.tag}: could not read {src.root} "
+                                f"({exc.__class__.__name__}: {exc})", line=True), file=sys.stderr)
         if not hits:
             sys.exit(f"no session id {'starts with' if args.id else 'is'} {want!r}")
         if len(hits) > 1 and args.id:
@@ -1352,7 +1362,7 @@ def main():
         rows, _, warns = load_rows([src], None, False, False, include_teams=True,
                                    include_scratch=True, include_empty=True, include_archived=True)
         for w in warns:
-            print(f"warning: {w}", file=sys.stderr)
+            print(safe_text(f"warning: {w}", line=True), file=sys.stderr)
         row = next((r for r in rows if r["id"] == sid), None)
         if row is None:
             sys.exit(f"session {sid} could not be read")
@@ -1371,7 +1381,7 @@ def main():
         include_archived=args.archived,
         limit_counts_visible=load_skipped and not (args.teams and args.scheduled and args.background))
     for w in warnings:
-        print(f"warning: {w}", file=sys.stderr)
+        print(safe_text(f"warning: {w}", line=True), file=sys.stderr)
     if not rows:
         sys.exit("no sessions found")
     try:
@@ -1383,7 +1393,7 @@ def main():
 
     if not interactive:
         while STATE_PROBLEMS:
-            print(f"warning: {STATE_PROBLEMS.pop(0)}", file=sys.stderr)
+            print(safe_text(f"warning: {STATE_PROBLEMS.pop(0)}", line=True), file=sys.stderr)
         apply_review(rows, load_review())
         hid = load_hidden()
         rows = [r for r in rows if (hide_key(r) in hid) == args.hidden
@@ -1394,7 +1404,13 @@ def main():
             sys.exit("no matching sessions")
         if args.print_cd:
             # Non-interactive resume: the newest match, printed, not run.
-            print(rows[0]["source"].launch(rows[0], args.yolo)[2])
+            # The output is read by a shell (cd "$(hopback --print-cd x)"), so it
+            # is printed exactly as launch() built it: changing a path would cd
+            # somewhere else. launch() refuses control characters instead.
+            try:
+                print(rows[0]["source"].launch(rows[0], args.yolo)[2])
+            except RuntimeError as exc:
+                sys.exit(safe_text(str(exc), line=True))
             return
         plain(rows, total, scoped)
         return
@@ -1409,13 +1425,13 @@ def main():
     try:
         argv, target, shown = src.launch(chosen, yolo)
     except RuntimeError as exc:
-        sys.exit(str(exc))
+        sys.exit(safe_text(str(exc), line=True))
 
     # An inferred or missing path must not be guessed into: chdir'ing into the
     # wrong tree would resume the session against it. Stay put and say so.
     if not target or not Path(target).is_dir():
-        print(f"warning: {target or '(no directory)'} does not exist here; "
-              f"resuming from {Path.cwd()}", file=sys.stderr)
+        print(safe_text(f"warning: {target or '(no directory)'} does not exist here; "
+                        f"resuming from {Path.cwd()}", line=True), file=sys.stderr)
         target = str(Path.cwd())
 
     if args.print_cd:
@@ -1423,7 +1439,7 @@ def main():
         return
 
     tag = "  [skip-permissions]" if yolo else ""
-    print(f"→ {chosen['name']}  ({src.label}){tag}", file=sys.stderr)
+    print(safe_text(f"→ {chosen['name']}  ({src.label}){tag}", line=True), file=sys.stderr)
     if src.adapter.NAME == "claude" and src.host == this_host() and hasattr(os, "getuid"):
         tmp = Path(os.environ.get("CLAUDE_CODE_TMPDIR") or "/tmp") / f"claude-{os.getuid()}"
         bad = foreign_owned(tmp)
