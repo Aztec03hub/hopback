@@ -262,6 +262,17 @@ def test_model_rates_scans_a_store_once():
     finally:
         claude.last_line_with = real
     assert first and len(calls) == first, (first, len(calls))
+    # Warming reads the store; a later lookup then reads nothing.
+    claude._RATES.clear()
+    calls.clear()
+    claude.last_line_with = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        claude.warm_rates(store)
+        warmed = len(calls)
+        claude.model_rates({"no-such-model"}, store)
+    finally:
+        claude.last_line_with = real
+    assert warmed and len(calls) == warmed
 
 
 def test_shell_launch_parser():

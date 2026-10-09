@@ -473,6 +473,11 @@ def _file_rates(store, max_files):
         return _RATES[store]
 
 
+def warm_rates(store, max_files=200):
+    """Read the rates now, so the first preview needn't (see _file_rates)."""
+    _file_rates(store, max_files)
+
+
 def model_rates(want, store, skip=None, max_files=200):
     """Price per weighted token for each model in `want`, measured from cost
     records that Claude Code itself wrote.

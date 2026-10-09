@@ -52,7 +52,7 @@ import sys
 import time
 from pathlib import Path
 
-from .adapters import AGENT, BY_NAME, LEFTOVER, ROLES, SCHEDULED
+from .adapters import AGENT, BY_NAME, LEFTOVER, ROLES, SCHEDULED, claude
 from .fmt import size_str, when
 from .paths import this_host
 from .sources import HOSTS, SRCW, discover
@@ -399,16 +399,27 @@ def _exit_with_parent(parent):
     threading.Thread(target=watch, daemon=True).start()
 
 
-def preview_pool():
+def _pool_init(parent, stores):
+    """Each worker watches its parent, then reads the cost rates of every store
+    once (the scan is per process, and would otherwise cost the first preview
+    a second or two in each worker)."""
+    _exit_with_parent(parent)
+    for store in stores:
+        claude.warm_rates(Path(store))
+
+
+def preview_pool(stores=()):
     """Worker processes for the preview pane, started before Textual takes over
     stdio (spawning afterwards fails on its replaced file descriptors). spawn,
-    not fork: forking a process that runs threads can deadlock the child."""
+    not fork: forking a process that runs threads can deadlock the child.
+    `stores`: the Claude project directories whose cost rates the workers read
+    as they start."""
     import concurrent.futures
     import multiprocessing
     try:
         pool = concurrent.futures.ProcessPoolExecutor(
             max_workers=2, mp_context=multiprocessing.get_context("spawn"),
-            initializer=_exit_with_parent, initargs=(os.getpid(),))
+            initializer=_pool_init, initargs=(os.getpid(), tuple(str(s) for s in stores)))
         for _ in range(2):
             pool.submit(int)   # start both workers now, while startup is under way
     except (OSError, ImportError, NotImplementedError, ValueError):
@@ -660,7 +671,8 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self._previews = {}
             self._preview_key = None
             self._preview_timer = None
-            self._pool = preview_pool()
+            self._pool = preview_pool(sorted({str(s.root / "projects") for s in sources
+                                              if s.adapter is claude}))
             self.hidden = load_hidden()
             self.view_hidden = start_hidden
             self.review = load_review()
