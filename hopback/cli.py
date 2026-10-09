@@ -1452,6 +1452,17 @@ def main():
                        "the listed paths"
                      + (f", then run: sudo systemd-tmpfiles --create {conf}" if conf.exists() else ""))
     os.chdir(target)
+    exec_agent(argv)
+
+
+def exec_agent(argv):
+    """Replace hopback with the agent. exec skips Python's exit handlers, so the
+    preview pool's semaphores would stay registered with multiprocessing's
+    resource tracker; it outlives the exec and, when the agent exits, prints
+    "There appear to be 5 leaked semaphore objects". Run multiprocessing's own
+    exit handler first, which unlinks them and lets the tracker go quietly."""
+    from multiprocessing import util
+    util._exit_function()  # pyright: ignore[reportAttributeAccessIssue]
     try:
         os.execvp(argv[0], argv)
     except OSError as exc:

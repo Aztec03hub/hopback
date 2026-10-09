@@ -1215,6 +1215,28 @@ def test_hidden_and_review_views_list_the_right_rows():
         cli.save_review({})
 
 
+def test_exec_leaves_no_leaked_semaphores():
+    # The preview pool, torn down as on_unmount does, then exec into the agent:
+    # without the cleanup the resource tracker warns when the agent exits.
+    import subprocess
+    script = (
+        "from hopback import cli\n"
+        "pool = cli.preview_pool()\n"
+        "assert pool is not None\n"
+        "pool.submit(int).result()\n"
+        "for p in list(pool._processes.values()): p.kill()\n"
+        "pool.shutdown(wait=False, cancel_futures=True)\n"
+        "cli.exec_agent(['true'])\n")
+    root = str(Path(__file__).resolve().parent.parent)
+    out = subprocess.run([sys.executable, "-c", script], cwd=root, capture_output=True,
+                         text=True, timeout=60, env={**os.environ, "PYTHONPATH": root})
+    assert out.returncode == 0, out.stderr
+    # The tracker writes its warning after the exec'd process exits; give it a moment.
+    import time
+    time.sleep(0.5)
+    assert "leaked semaphore" not in out.stderr, out.stderr
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
