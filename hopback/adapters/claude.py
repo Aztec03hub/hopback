@@ -8,6 +8,7 @@ import re
 import time
 from pathlib import Path
 
+from .. import launches
 from ..fmt import size_str
 
 NAME = "claude"
@@ -497,6 +498,25 @@ def session_cost(path):
     return cost, False, rec.get("totalLinesAdded"), rec.get("totalLinesRemoved")
 
 
+def spawn_parents(root):
+    """({session id: the session whose Claude started it}, [problem, ...]);
+    see launches.py. A failure here is a bug in the detector: it becomes a
+    problem shown above the list and nothing is marked, so the list loads."""
+    problems = []
+    try:
+        return launches.started_by(root, problems), problems
+    except Exception as exc:  # noqa: BLE001 - reported, not hidden
+        problems.append(f"spawn detection failed, nothing marked as started by another session "
+                        f"({exc.__class__.__name__}: {exc})")
+        return {}, problems
+
+
+def session_title(root, sid):
+    path = find_session(root, sid)
+    got = scan(path) if path else {}
+    return got.get("customTitle") or got.get("aiTitle") or "untitled session"
+
+
 def find_session(root, sid):
     for p in (root / "projects").glob(f"*/{sid}.jsonl"):
         return p
@@ -504,18 +524,25 @@ def find_session(root, sid):
 
 
 def collect(root, limit, here_only, deep, include_teams=True, include_scratch=False,
-            include_empty=False, limit_counts_visible=False, **_):
-    """Walk the store newest-first.
+            include_empty=False, limit_counts_visible=False, only=None, **_):
+    """Walk the store newest-first: (rows, sessions in the store, problems),
+    problems being what went wrong without costing the list (load_rows shows
+    them). Other adapters return just the first two.
 
     limit_counts_visible exists for the picker, which LOADS agent sessions so
     the toggle can reveal them without a rescan but HIDES them initially.
     Without it the limit is spent on rows nobody asked to see: with 81% of the
     store being SDK runs, a limit of 300 yielded about 8 visible rows.
+
+    only: a set of session ids; just those are read, whatever their age.
     """
     files = sorted((root / "projects").glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    sids = {p.stem for p in files}
+    if only is not None:
+        files = [p for p in files if p.stem in only]
     here = str(Path.cwd().resolve())
     leads = team_leads(root)
-    sids = {p.stem for p in files}
+    started, problems = spawn_parents(root)
     rows = []
     counted = 0
     for path in files:
@@ -551,6 +578,8 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
             role, team_info = "copy", f"continued in {got['continuedIn']}"
         elif is_job_scratch(cwd):
             role, team_info = "job", "run inside a background job's scratch directory"
+        elif sid in started:
+            role, team_info = "spawn", f"started by {started[sid] or 'another session'}"
         else:
             role, team_info = "", ""
         # Filter here rather than after, so -n counts rows you actually see.
@@ -558,7 +587,13 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
             continue
         if not include_scratch and is_scratch(cwd):
             continue
-        if not limit_counts_visible or role not in ("team", "sdk", "copy", "job"):
+        # A spawn row is kept even when hidden, since a Review rejection can
+        # bring it back as yours; it doesn't spend the limit unless shown.
+        if limit_counts_visible:
+            hidden = role in ("team", "sdk", "copy", "job", "spawn")
+        else:
+            hidden = role == "spawn" and not include_teams
+        if not hidden:
             counted += 1
         rows.append({
             "mtime": st.st_mtime,
@@ -575,7 +610,7 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
             "named": bool(got.get("customTitle")),
             "guessed": guessed,
         })
-    return rows, len(files)
+    return rows, len(files), problems
 
 
 def details(root, sid):
@@ -611,6 +646,14 @@ def details(root, sid):
         if sid in leads:
             nm, n = leads[sid]
             fields.append(("agent team", f"LEAD of {nm}, {n} members"))
+    try:
+        parent = launches.known_parents(root).get(sid)
+    except Exception as exc:  # noqa: BLE001 - shown in this field, not hidden
+        fields.append(("started by", f"unknown: spawn detection failed ({exc.__class__.__name__}: {exc})"))
+    else:
+        if parent is not None:
+            fields.append(("started by", f"{session_title(root, parent)}  ({parent})" if parent
+                           else "another session's Claude (two launches could have)"))
     if got.get("continuedIn") and find_session(root, got["continuedIn"]):
         fields.append(("continued in", f"{got['continuedIn']}  (this file is the older copy)"))
     by_role = last_by_role(path)

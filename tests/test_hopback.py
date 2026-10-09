@@ -21,6 +21,8 @@ HOME.mkdir()
 WIN.mkdir()
 os.environ["HOME"] = str(HOME)
 os.environ["HOPBACK_WINDOWS_HOME"] = str(WIN)
+os.environ["XDG_STATE_HOME"] = str(TMP / "state")  # never the real hidden list
+os.environ["XDG_CACHE_HOME"] = CACHE = str(TMP / "cache")   # nor the real launch cache
 
 import demo_store  # noqa: E402
 from hopback import cli, paths, readers  # noqa: E402
@@ -101,7 +103,8 @@ def test_background_job_leftovers():
     session("diverged", [hand_over, note, reply])  # resumed later: both are real
     session("dangling", [{"type": "continued-in", "continuedInSessionId": "gone"}])
     session("scratch", [], cwd="/home/u/.claude/jobs/06f5ccaf/tmp/tuitest")
-    rows, _ = claude.collect(root, None, False, False, include_empty=True)
+    rows, _, problems = claude.collect(root, None, False, False, include_empty=True)
+    assert problems == [], problems
     roles = {r["id"]: r["role"] for r in rows}
     assert roles == {"new": "", "stale": "copy", "diverged": "", "dangling": "", "scratch": "job"}, roles
     shown = {r["id"] for r in rows if cli.keep(r, False, False)}
@@ -241,6 +244,486 @@ def test_picker_controls():
             app.query_one("#search", Input).value = IDS["hermes-d-cli"]
             await p.pause()
             assert [r["id"] for r in app._visible] == [IDS["hermes-d-cli"]], app._visible
+    asyncio.run(drive())
+
+
+def test_shell_launch_parser():
+    """The parser's own table of launches and look-alikes (hopback/shellparse.py)."""
+    from hopback import shellparse
+    shellparse.self_check()
+
+
+def test_spawned_sessions():
+    """Only a session whose opening prompt came out of another Claude's own
+    tool call, made just before it started, counts as spawned."""
+    import json
+    from datetime import datetime, timezone
+    from hopback import launches
+    root = TMP / "botstore" / ".claude"
+    proj = root / "projects" / "-p"
+    proj.mkdir(parents=True)
+    T = 1_800_000_000
+
+    def ts(t):
+        return datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def write(sid, recs):
+        (proj / f"{sid}.jsonl").write_text(
+            "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in recs))
+
+    def call(t, tool="Bash", **inp):
+        return {"type": "assistant", "timestamp": ts(t), "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "x", "name": tool, "input": inp}]}}
+
+    def said(t, role, text):
+        return {"type": role, "timestamp": ts(t), "message": {"role": role, "content": text}}
+
+    inline = "You are lane-x, an implementer for the lead. Read the brief and build it."
+    typed = "You are a reviewer of the cache layer. Read the plan, then report back please."
+    pasted = "Summarise the quarterly numbers for me and draft the email to the whole team."
+    late = "You are a late starter that began well after the launch command finished."
+    write("parent", [
+        said(T - 120, "user", pasted),                      # a person's own message
+        call(T - 100, command=f"tmux new-window -d \"claude --model sonnet 'You are \\\"lane-x\\\", an implementer for the lead. Read the brief and build it.'\""),
+        call(T - 50, command="tmux new-window -d -n rev 'claude --dangerously-skip-permissions'"),
+        call(T - 40, command=f"tmux send-keys -t rev -l '{typed}' && tmux send-keys -t rev Enter"),
+        call(T - 300, command=f"claude --model sonnet '{late}'"),
+    ])
+    write("bot1", [said(T - 99, "user", inline)])               # quotes stripped by the shell
+    write("bot2", [{"type": "mode", "timestamp": ts(T - 49)}, said(T - 39, "user", typed)])
+    write("human", [said(T - 95, "user", pasted)])              # pasted, never in a tool call
+    write("slow", [said(T - 300 + 60, "user", late)])           # 60 s after its launch
+    # Pasted text inside a tool call but with no launch: still not spawned.
+    write("other", [call(T - 2000, command=f"echo '{late}'")])
+
+    # False-positive traps from review: `claude` that isn't a launch, and text
+    # the parent only read, not sent.
+    handoff = "Continue the migration work from the handoff note and keep the tests green."
+    write("lead2", [
+        call(T + 1000, "Write", file_path="/w/docs/HANDOFF.md", content=handoff),
+        call(T + 1090, command="git commit -m 'docs: claude handoff'"),     # not a launch
+        call(T + 2000, "Read", file_path="/w/docs/HANDOFF-claude-session-notes.md"),
+        call(T + 2005, command="pkill claude; rg claude /w"),              # not a launch
+    ])
+    write("paste1", [said(T + 1102, "user", handoff)])
+    write("paste2", [said(T + 2010, "user", "/w/docs/HANDOFF-claude-session-notes.md and go on from it")])
+    # A prompt file written with Write, then passed in by name: spawned.
+    brief = "You are the E1 launcher for an agent experiment. Make exactly one Agent call."
+    write("lead3", [
+        call(T + 3000, "Write", file_path="/w/exp/E1-launcher-prompt.txt", content=brief),
+        call(T + 3060, command='tmux new-window -d "claude --dangerously-skip-permissions \\"$(cat $X/E1-launcher-prompt.txt)\\""'),
+    ])
+    write("e1", [said(T + 3061, "user", brief)])
+    # Two copies of one conversation hold the same launch: the newer is named.
+    copied = "You are the copy test implementer. Build the unit and report to the lead."
+    launch = call(T + 4000, command=f"claude '{copied}'")
+    write("orig", [launch])
+    write("cont", [launch, said(T + 4100, "user", "later work")])
+    os.utime(proj / "orig.jsonl", (1_000_000_000, 1_000_000_000))   # the older copy
+    write("kid", [said(T + 4001, "user", copied)])
+
+    # One guard at a time. `claude` not in command position, though the
+    # command does carry the text a person then pastes:
+    noted = "Fix the flaky date test in the billing module and add a regression test."
+    write("lead4", [call(T + 5000, command=f"pkill claude; echo '{noted}' >> notes.txt")])
+    write("paste3", [said(T + 5005, "user", noted)])
+    # A real launch, plus a file it never names that a person then pastes from:
+    stray = "Draft the release notes for version two and list every breaking change."
+    write("lead5", [
+        call(T + 6000, "Write", file_path="/w/notes/release.md", content=stray),
+        call(T + 6010, command="claude --model sonnet 'Run the nightly smoke tests and report back.'"),
+    ])
+    write("paste4", [said(T + 6015, "user", stray)])
+    # A launch that does name a prompt file, and a path the parent only Read:
+    path = "/w/projects/acme-platform/docs/briefs/overview-of-the-billing-system.md"
+    write("lead6", [
+        call(T + 7000, "Read", file_path=path),
+        call(T + 7010, command='claude "$(cat /w/briefs/nightly-prompt.txt)"'),
+    ])
+    write("paste5", [said(T + 7015, "user", path)])
+
+    # A handoff written with a heredoc that mentions `claude`, then pasted:
+    note = "Pick up the parser refactor from the notes below and finish the last two steps."
+    write("lead7", [call(T + 8000, command=f"cat > H.md <<'EOF'\n{note}\nRun `claude` to start.\nclaude --model x\nEOF")])
+    write("paste6", [said(T + 8010, "user", note)])
+
+    problems = []
+    got = launches.started_by(root, problems)
+    assert got == {"bot1": "parent", "bot2": "parent", "e1": "lead3", "kid": "cont"}, got
+    assert launches.started_by(root, problems) == got and problems == []   # warm cache, same answer
+    rows, _, _ = claude.collect(root, None, False, False, include_empty=True)
+    roles = {r["id"]: r["role"] for r in rows}
+    assert roles["bot1"] == roles["bot2"] == "spawn" and roles["human"] == "", roles
+    # `hopback -l -n N` shows N sessions: hidden spawn rows don't spend the limit.
+    shown = [r for r in rows if cli.keep(r, False, False, False)]
+    limited, _, _ = claude.collect(root, len(shown), False, False, include_teams=False, include_empty=True)
+    assert len([r for r in limited if cli.keep(r, False, False, False)]) == len(shown), limited
+    fields = dict(claude.details(root, "bot1")["fields"])
+    assert fields["started by"].endswith("(parent)"), fields
+    # An unreadable parent is reported and left undecided, never settled as "no".
+    os.environ["XDG_CACHE_HOME"] = str(TMP / "botcache-unreadable")
+    parent = next(root.glob("projects/*/parent.jsonl"))
+    if os.getuid() != 0:                       # root reads anything
+        # Cold: the parent can't be read at all, and the children are long
+        # settled. They must stay undecided, not become "not spawned" for good.
+        parent.chmod(0)
+        real_settle, launches.SETTLE = launches.SETTLE, -1e12
+        try:
+            problems = []
+            got2 = launches.started_by(root, problems)
+            assert "bot1" not in got2 and any("not checked" in p for p in problems), (got2, problems)
+            assert "bot1" not in launches.load_cache(launches.cache_path(root))["verdicts"]
+        finally:
+            parent.chmod(0o644)
+            launches.SETTLE = real_settle
+        # Warm: its launches are cached, and only the verdict step reads it.
+        launches.started_by(root, [])
+        cpath = launches.cache_path(root)
+        cache = json.loads(cpath.read_text())
+        del cache["verdicts"]["bot1"]
+        cpath.write_text(json.dumps(cache))
+        parent.chmod(0)
+        try:
+            problems = []
+            got3 = launches.started_by(root, problems)
+            assert "bot1" not in got3 and any("not checked" in p for p in problems), (got3, problems)
+            assert "bot1" not in json.loads(cpath.read_text())["verdicts"]   # undecided, not "no"
+        finally:
+            parent.chmod(0o644)
+    assert launches.started_by(root, [])["bot1"] == "parent"   # decided once readable
+    os.environ["XDG_CACHE_HOME"] = CACHE
+
+
+def test_foreign_owned_tmp():
+    """Paths Claude Code would refuse to start over are found; a symlink to a
+    root-owned file is not one, and a missing directory is fine."""
+    base = TMP / "claude-tmp"
+    (base / "a" / "b").mkdir(parents=True)
+    (base / "a" / "b" / "deep.txt").write_text("x")
+    (base / "link").symlink_to("/etc/passwd")          # root-owned target
+    locked = base / "locked"
+    locked.mkdir()
+    locked.chmod(0)                                   # ours, just unreadable
+    try:
+        assert cli.foreign_owned(base) == []
+    finally:
+        locked.chmod(0o700)
+    assert cli.foreign_owned(TMP / "missing") == []
+    real_lstat, deep = os.lstat, str(base / "a" / "b" / "deep.txt")
+
+    class Foreign:
+        st_uid = os.getuid() + 1
+
+    def fake_lstat(path, *a, **kw):
+        return Foreign() if str(path) == deep else real_lstat(path, *a, **kw)
+    os.lstat = fake_lstat
+    try:
+        assert cli.foreign_owned(base) == [deep]
+    finally:
+        os.lstat = real_lstat
+    real_getuid = os.getuid
+    os.getuid = lambda: real_getuid() + 1
+    try:
+        assert cli.foreign_owned(base) == [str(base)]     # root itself is foreign
+    finally:
+        os.getuid = real_getuid
+
+
+def test_review_of_spawned_sessions():
+    """The Review view's data: every marked session with its evidence, the
+    ones that change the list first; verdicts persist; a rejection puts the
+    session back in the user's list."""
+    import json
+    from datetime import datetime, timezone
+    from hopback.sources import Source
+    root = TMP / "reviewstore" / ".claude"
+    proj = root / "projects" / "-w"
+    proj.mkdir(parents=True)
+    T = 1_800_000_000
+
+    def ts(t):
+        return datetime.fromtimestamp(t, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def write(sid, recs):
+        (proj / f"{sid}.jsonl").write_text(
+            "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in recs))   # as Claude writes
+    prompt = "You are the review test implementer. Build the unit and report back to the lead."
+    write("lead", [{"type": "custom-title", "customTitle": "The lead"},
+                   {"type": "assistant", "timestamp": ts(T), "cwd": "/w", "message": {
+                       "role": "assistant", "content": [{"type": "tool_use", "name": "Bash",
+                                                         "input": {"command": f"claude '{prompt}'"}}]}}])
+    write("kid", [{"type": "user", "timestamp": ts(T + 1), "cwd": "/w",
+                   "message": {"role": "user", "content": prompt}},
+                  {"type": "assistant", "timestamp": ts(T + 2), "cwd": "/w",
+                   "message": {"role": "assistant", "content": "ok"}}])
+    os.environ["XDG_CACHE_HOME"] = str(TMP / "reviewcache")
+    try:
+        src = Source(paths.this_host(), claude, root)
+        rows, problems = cli.review_rows([src])
+        assert [r["id"] for r in rows] == ["kid"] and rows[0]["review_changes"] and not problems, rows
+        text = cli.preview(rows[0])
+        assert "why it was marked" in text and "The lead" in text and "1.0 s after" in text, text
+        cli.save_review({"kid": "rejected"})
+        assert cli.load_review() == {"kid": "rejected"}
+        listed, _, _ = claude.collect(root, None, False, False, include_empty=True)
+        kid = next(r for r in listed if r["id"] == "kid")
+        assert kid["role"] == "spawn"
+        cli.apply_review(listed, cli.load_review())
+        assert kid["role"] == ""                      # rejected: shown as the user's again
+        cli.apply_review(listed, {"kid": "accepted"})
+        assert kid["role"] == "spawn" and kid["team"].startswith("started by")   # undone
+        cli.apply_review(listed, {})
+        assert kid["role"] == "spawn"
+        cli.review_path().write_text("[1, 2]")        # damaged file: no verdicts, no crash
+        assert cli.load_review() == {}
+        cli.review_path().write_text('{"kid": ["x"]}')  # unhashable verdict: ignored
+        assert cli.load_review() == {}
+        # A detector bug is shown, never hidden, and the list still loads.
+        from hopback import launches
+
+        def broken(*_):
+            raise KeyError("boom")
+        real_started, real_known = launches.started_by, launches.known_parents
+        launches.started_by = launches.known_parents = broken
+        try:
+            got, _, warns = cli.load_rows([src], None, False, False, include_empty=True)
+            assert {r["id"] for r in got} >= {"lead", "kid"}, got
+            assert any("spawn detection failed" in w and "boom" in w for w in warns), warns
+            assert cli.review_rows([src]) == ([], [f"{src.tag}: spawn detection failed (KeyError: 'boom')"])
+            assert "started by" in cli.preview(next(r for r in got if r["id"] == "kid")) \
+                and "unknown: spawn detection failed" in cli.preview(next(r for r in got if r["id"] == "kid"))
+        finally:
+            launches.started_by, launches.known_parents = real_started, real_known
+    finally:
+        cli.save_review({})
+        os.environ["XDG_CACHE_HOME"] = CACHE
+
+
+def test_review_view_while_loading():
+    """F12 then a mark before the scan returns records nothing and shows an
+    empty list, not the main list with marks landing on its rows."""
+    import time as _time
+    rows, total = load()
+    real = cli.review_rows
+    cli.review_rows = lambda sources: (_time.sleep(1.0), ([], []))[1]
+    try:
+        async def drive():
+            app = cli.build_app(rows, "", False, total, False, discover())
+            async with app.run_test(size=(160, 50)) as p:
+                await p.pause()
+                await p.press("f12")
+                await p.pause(0.2)
+                assert app.view_review and app.review_rows is None
+                assert app._visible == [], len(app._visible)
+                await p.press("1")
+                await p.pause(0.2)
+                assert cli.load_review() == {}
+                await app.workers.wait_for_complete()
+                await p.pause()
+                assert app.review_rows == [] and app.view_review
+        asyncio.run(drive())
+    finally:
+        cli.review_rows = real
+        cli.save_review({})
+
+
+def test_review_marking():
+    """Fast marks all land, each on its own row; the view opens on the first
+    unmarked row; a mark a failed save couldn't write is saved by the next."""
+    rows, total = load()
+    fake = [dict(r, review=True, review_changes=True) for r in rows[:5]]
+    # The [x] mark fits inside the NAME column: long names don't push the rest right.
+    import time as _time
+    long_, short = (dict(fake[0], name=n, review_mark="✓") for n in ("x" * 60, "short"))
+    lines = [cli.fmt(r, 34, "/nowhere", _time.time()) for r in (long_, short)]
+    assert len(lines[0]) == len(lines[1]), lines
+    ids = [r["id"] for r in fake]
+    real_rows, real_save = cli.review_rows, cli.save_review
+    cli.review_rows = lambda sources: (fake, [])
+    cli.save_review({ids[0]: "accepted"})
+    try:
+        async def drive():
+            app = cli.build_app(rows, "", False, total, False, discover())
+            async with app.run_test(size=(160, 50)) as p:
+                await p.pause()
+                # Outside the Review view, digits never mark (list focused, too).
+                app.query_one("#list").focus()
+                await p.press("1")
+                assert cli.load_review() == {ids[0]: "accepted"}
+                app.query_one("#search").focus()
+                await p.press("f12")
+                await app.workers.wait_for_complete()
+                await p.pause()
+                lv = app.query_one("#list")
+                assert lv.index == 1, lv.index             # the first unmarked
+                # With the list focused (a click on a row), digits still mark.
+                # Once a search has begun, digits type instead of marking.
+                await p.press("a", "1")
+                assert app.query_one("#search").value == "a1" and cli.load_review() == {ids[0]: "accepted"}
+                await p.press("ctrl+u")
+                await p.pause()
+                lv.focus()
+                lv.index = 1
+                await p.pause()
+                assert type(app.focused).__name__ == "SessionList", app.focused
+                await p.press("2")
+                assert cli.load_review().get(ids[1]) == "rejected", cli.load_review()
+                cli.save_review({ids[0]: "accepted"})
+                app.review = cli.load_review()
+                app.query_one("#search").focus()
+                lv.index = 1
+                await p.pause()
+                await p.press("2", "3", "1")               # no pauses between keys
+                assert cli.load_review() == {ids[0]: "accepted", ids[1]: "rejected",
+                                             ids[2]: "discuss", ids[3]: "accepted"}
+                assert lv.index == 4 and "[✗]" in str(lv.children[1].query_one("Static").render())
+
+                def fail(_):
+                    raise OSError("disk full")
+                cli.save_review = fail
+                await p.press("2")                         # ids[4]: kept in memory only
+                cli.save_review = real_save
+                assert ids[4] not in cli.load_review()
+                lv.index = 3
+                await p.press("0")                         # clears ids[3], saves ids[4] too
+                saved = {ids[0]: "accepted", ids[1]: "rejected", ids[2]: "discuss", ids[4]: "rejected"}
+                assert cli.load_review() == saved
+                assert "(1)" in str(app.query_one("#m-acc").render())   # ids[0] only
+                assert "Review 4/5" in str(app.query_one("#reviewtab").render())
+                lv.index = 4                               # the last row: the cursor stays
+                await p.press("3")
+                assert lv.index == 4 and cli.load_review()[ids[4]] == "discuss"
+                saved[ids[4]] = "discuss"
+                # A rebuild requested but not yet on screen: a mark must not
+                # land on a row of the list that is about to be replaced.
+                pending = app.refresh_rows()
+                app.action_mark("accepted")
+                assert cli.load_review() == saved
+                await pending
+                await p.pause()
+                lv.index = 3
+                app.action_mark("accepted")                # on screen now: it lands
+                assert cli.load_review()[ids[3]] == "accepted"
+                await p.pause()                            # let the cursor move settle before exit
+        asyncio.run(drive())
+    finally:
+        cli.review_rows, cli.save_review = real_rows, real_save
+        cli.save_review({})
+
+
+def test_damaged_state_is_kept():
+    """A damaged hidden/review file is moved aside and reported, never
+    overwritten; an unreadable one raises instead of reading as empty."""
+    for path, load in ((cli.hidden_path(), cli.load_hidden), (cli.review_path(), cli.load_review)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for bad in (b"[", b'["a\xff"]', b"[" * 100000):     # truncated, bad UTF-8, too deep
+            path.write_bytes(bad)
+            cli.STATE_PROBLEMS.clear()
+            assert not load() and not path.exists()
+            kept = [p for p in path.parent.iterdir() if p.name.startswith(path.name + ".damaged-")]
+            assert len(kept) == 1 and kept[0].read_bytes() == bad, kept
+            assert cli.STATE_PROBLEMS and kept[0].name in cli.STATE_PROBLEMS[0], cli.STATE_PROBLEMS
+            kept[0].unlink()
+        cli.STATE_PROBLEMS.clear()
+        # Two damaged copies in a row are both kept.
+        for bad in (b"x", b"y"):
+            path.write_bytes(bad)
+            load()
+        kept = sorted(p.read_bytes() for p in path.parent.iterdir() if p.name.startswith(path.name + ".damaged-"))
+        assert kept == [b"x", b"y"], kept
+        for p in list(path.parent.iterdir()):
+            if p.name.startswith(path.name + ".damaged-"):
+                p.unlink()
+        cli.STATE_PROBLEMS.clear()
+        # Another hopback saves a good file between this one's read and its
+        # move: the good file must survive, not be set aside as damaged.
+        good = b'{"x": "accepted"}' if load is cli.load_review else b'["claude:x"]'
+        real_read = type(path).read_bytes
+        state = {"raced": False}
+
+        def racing_read(self, _real=real_read, _path=path):
+            data = _real(self)
+            if self == _path and not state["raced"]:
+                state["raced"] = True          # damaged bytes read; the other instance saves now
+                self.write_bytes(good)
+                return b"["
+            return data
+        path.write_bytes(b"[")
+        type(path).read_bytes = racing_read
+        try:
+            got = load()
+        finally:
+            type(path).read_bytes = real_read
+        assert got and path.read_bytes() == good and not cli.STATE_PROBLEMS, (got, cli.STATE_PROBLEMS)
+        assert not [p for p in path.parent.iterdir() if ".damaged-" in p.name]
+        path.unlink()
+        if os.getuid() != 0:                       # root reads anything
+            path.write_text("{}" if load is cli.load_review else "[]")
+            path.chmod(0)
+            try:
+                load()
+                raise AssertionError("an unreadable file read as empty")
+            except PermissionError:
+                pass
+            finally:
+                path.chmod(0o644)
+                path.unlink()
+
+
+def test_plain_list_honours_hidden():
+    """`hopback -l` runs end to end, leaves hidden sessions out, and --hidden
+    lists only them."""
+    import subprocess
+    victim = row(IDS["claude-win"])
+    cli.save_hidden({cli.hide_key(victim)})
+    try:
+        def ids(*flags):
+            res = subprocess.run([sys.executable, "-m", "hopback", "-l", *flags], cwd=ROOT,
+                                 capture_output=True, text=True, env=os.environ)
+            assert res.returncode == 0, res.stderr
+            return {ln.split()[-1] for ln in res.stdout.splitlines()[1:] if ln.strip()}
+        assert victim["id"] not in ids()
+        assert ids("--hidden") == {victim["id"]}
+    finally:
+        cli.save_hidden(set())
+
+
+def test_hiding_sessions():
+    """CTRL-X hides the selected session, the hidden view lists it with its
+    harness, TAB never lands on that view, and the choice persists on disk."""
+    rows, total = load()
+    from textual.widgets import Tabs
+
+    async def drive():
+        app = cli.build_app(rows, "", False, total, False, discover())
+        async with app.run_test(size=(160, 50)) as p:
+            async def press(*keys):
+                await p.press(*keys)
+                await app.workers.wait_for_complete()
+                await p.pause()
+
+            await p.pause()
+            base = len(app._visible)
+            victim = app._visible[0]
+            await press("ctrl+x")
+            assert len(app._visible) == base - 1 and victim not in app._visible
+            assert cli.hide_key(victim) in cli.load_hidden()
+            label = str(app.query_one("#tabs", Tabs).query_one("#t-all").label)
+            assert "(+1 hidden)" in label, label
+            await p.click("#hiddentab")
+            await app.workers.wait_for_complete()
+            await p.pause()
+            assert app.view_hidden and app._visible == [victim]
+            assert app.query_one("#tabs", Tabs).active == ""
+            # TAB leaves the hidden view for the harness tab you were on.
+            await press("tab")
+            assert not app.view_hidden and app.harness is None
+            await press("tab", "tab", "tab")       # all -> claude -> codex -> hermes
+            assert not app.view_hidden
+            await press("ctrl+g")
+            assert app.view_hidden
+            await press("ctrl+x")                  # unhide from the hidden view
+            assert app._visible == [] and not cli.load_hidden()
     asyncio.run(drive())
 
 

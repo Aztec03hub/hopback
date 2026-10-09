@@ -26,6 +26,11 @@ class Source:
     adapter: ModuleType
     root: Path
 
+    def __reduce__(self):
+        # A module can't be pickled, its name can; the picker sends rows to a
+        # preview process.
+        return _source, (self.host, self.adapter.NAME, self.root)
+
     @property
     def tag(self):
         return f"{self.adapter.NAME}·{self.host}"
@@ -107,3 +112,8 @@ def discover(harness=None, host=None):
             except OSError:
                 continue  # an unreadable home must not take the others down
     return found
+
+
+def _source(host, adapter_name, root):
+    from .adapters import BY_NAME
+    return Source(host, BY_NAME[adapter_name], root)
