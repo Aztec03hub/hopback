@@ -823,6 +823,12 @@ def test_session_list_set_lines_set_line_and_hover():
             lv.hover = 1
             lv.set_lines(["a"], 0)
             assert lv.hover is None                      # a rebuild clears it
+            # Untrusted text: no control character reaches a screen line.
+            lv.set_lines(["x\x1b[2Jy\nz\ttab\x07\x9b"], 0)
+            lv.set_line(0, "q\x1b]0;title\x07r")
+            assert not any(ord(ch) < 32 or 0x7F <= ord(ch) < 0xA0 for ch in "".join(s.text for s in lv.render_line(0)))
+            assert cli.safe_text("a\x1b[0mb\nc\td") == "a [0mb\nc\td" and cli.safe_text("a\nb\t", line=True) == "a b "
+            await p.pause()
 
     asyncio.run(drive())
 

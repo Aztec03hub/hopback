@@ -47,6 +47,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -101,13 +102,24 @@ def wrap_into(out, text, width, limit=None):
             out.append("  " + line)
 
 
+# Terminal control characters: a session's title or reply is untrusted text, and an escape
+# sequence in it must not reach the terminal. The pane keeps newlines and tabs.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_CONTROL_LINE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def safe_text(text, line=False):
+    """`text` with control characters replaced by a space (a line of the list also loses \\n and \\t)."""
+    return (_CONTROL_LINE if line else _CONTROL).sub(" ", text)
+
+
 def preview(row, width=80):
     """The preview pane for one row, the same shape for every harness."""
     src = row["source"]
     try:
         d = src.adapter.details(src.root, row["id"])
     except Exception as exc:  # noqa: BLE001
-        return f"could not read this session: {exc.__class__.__name__}: {exc}"
+        return safe_text(f"could not read this session: {exc.__class__.__name__}: {exc}")
     if d is None:
         return "session not found in its store (deleted since the list loaded?)"
     title = d["title"] if len(d["title"]) <= 200 else d["title"][:199] + "…"
@@ -157,7 +169,7 @@ def preview(row, width=80):
         else:
             out.append("  (no record)")
         out.append("")
-    return "\n".join(out)
+    return safe_text("\n".join(out))
 
 
 def show_path(row, home):
@@ -479,7 +491,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
 
         def set_lines(self, lines, index):
             """Replace every row; the cursor lands on `index` (clamped)."""
-            self.lines = lines
+            self.lines = [safe_text(t, line=True) for t in lines]
             self.hover = None
             self._index = None
             self.virtual_size = Size(0, len(lines))
@@ -489,7 +501,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
 
         def set_line(self, i, text):
             """Change one row's text in place; cursor and scroll stay."""
-            self.lines[i] = text
+            self.lines[i] = safe_text(text, line=True)
             self.refresh()
 
         def render_line(self, y):
@@ -927,10 +939,10 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 except Exception as exc:  # noqa: BLE001
                     if key == self._preview_key:
                         self.query_one("#preview_body", Static).update(
-                            f"could not read this session: {exc.__class__.__name__}: {exc}")
+                            safe_text(f"could not read this session: {exc.__class__.__name__}: {exc}"))
                     return      # not cached: the next visit tries again
             except Exception as exc:  # noqa: BLE001
-                text = f"could not read this session: {exc.__class__.__name__}: {exc}"
+                text = safe_text(f"could not read this session: {exc.__class__.__name__}: {exc}")
                 if key == self._preview_key:
                     self.query_one("#preview_body", Static).update(text)
                 return          # not cached: the next visit tries again
