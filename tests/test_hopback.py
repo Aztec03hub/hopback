@@ -5,11 +5,15 @@ Run either way:
     python -m pytest tests
 """
 import asyncio
+import contextlib
+import io
 import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -32,19 +36,29 @@ from hopback.sources import discover  # noqa: E402
 IDS = demo_store.build(HOME, WIN)
 
 
-async def until(p, cond, what, tries=500):
-    """Poll `cond` with the pilot's clock. Not app.workers.wait_for_complete():
-    that gathers the preview worker too, which the app cancels itself when a
-    newer rebuild starts one, and the gather then raises WorkerCancelled."""
-    for _ in range(tries):
+async def until(p, cond, what, timeout=60):
+    """Poll `cond` with the pilot's clock until a wall-clock deadline (a loaded
+    machine can take many seconds to spawn the preview pool). Not
+    app.workers.wait_for_complete(): that gathers the preview worker too, which
+    the app cancels itself when a newer rebuild starts one, and the gather then
+    raises WorkerCancelled."""
+    deadline = time.monotonic() + timeout
+    while True:
         await p.pause(0.01)
         if cond():
             return
-    raise AssertionError(f"{what} never finished")
+        if time.monotonic() > deadline:
+            raise AssertionError(f"{what} never finished")
 
 
 async def rebuilt(app, p):
     await until(p, lambda: app._shown_ticket == app._refresh_ticket, "rebuild")
+
+
+def setup_function(fn=None):
+    """Before each test (pytest calls this; the runner below does too): an app
+    that closed in an earlier test set STOP, which would cut a later scan short."""
+    claude.STOP.clear()
 
 
 def load(**kw):
@@ -343,11 +357,18 @@ def test_model_rates_survive_malformed_records_and_vanished_files():
         "text": {"inputTokens": "9", "outputTokens": "x", "costUSD": "1"},
         "list": [1, 2],
         "nan": {"inputTokens": float("nan"), "outputTokens": 1, "costUSD": 1.0},
+        "inf": {"inputTokens": 1, "outputTokens": 1, "costUSD": float("inf")},   # _num needs isfinite
+        "bool": {"inputTokens": True, "outputTokens": 3, "costUSD": 0.5},        # a bool is not a count
         "opus": _usage(5.0)})
     _cost_session(proj, "notdict", T + 200, [1, 2, 3])
+    # A cost line json cannot parse for depth is no record, not an error.
+    deep = proj / "deep.jsonl"
+    deep.write_text('{"type":"cost-state","x":' + "[" * 100000 + "]" * 100000 + "}\n")
+    os.utime(deep, (T + 300, T + 300))
+    assert claude.last_line_with(deep, claude.COST_MARK) == (None, None)
     (proj / "gone.jsonl").symlink_to(proj / "no-such-target")   # globbed, then stat fails
     claude._RATES.clear()
-    r = claude.model_rates({"opus", "other", "text", "list", "nan"}, store)
+    r = claude.model_rates({"opus", "other", "text", "list", "nan", "inf", "bool"}, store)
     assert r.keys() == {"opus"} and abs(r["opus"] - 5.0) < 1e-9, r   # a bad entry costs only itself
     # The worker initializer cannot raise on such data either.
     claude._RATES.clear()
@@ -356,38 +377,117 @@ def test_model_rates_survive_malformed_records_and_vanished_files():
     claude._RATES.clear()
 
 
+def test_a_cached_store_is_not_blocked_by_a_scan_of_another():
+    """Two Claude stores (WSL and a slow /mnt/c): a lookup for one never waits
+    for the other's scan, cached or not."""
+    import threading
+    a, b = TMP / "storeA" / "projects", TMP / "storeB" / "projects"
+    T = 1_700_000_000
+    _cost_session(a / "-p", "s", T, {"m": _usage(2.0)})
+    _cost_session(b / "-p", "s", T, {"m": _usage(3.0)})
+    claude._RATES.clear()
+    claude.model_rates({"m"}, a)                       # A is cached
+    real = claude.last_line_with
+    entered, gate = threading.Event(), threading.Event()
+
+    def slow(path, *x, **k):
+        if b in path.parents:
+            entered.set()
+            gate.wait(60)
+        return real(path, *x, **k)
+    claude.last_line_with = slow
+    got = {}
+    scan_b = threading.Thread(target=lambda: got.__setitem__("b", claude.model_rates({"m"}, b)))
+    try:
+        scan_b.start()
+        assert entered.wait(60), "B's scan never started"
+
+        def look_a(key):
+            got[key] = claude.model_rates({"m"}, a)
+        for key in ("cached", "uncached"):
+            if key == "uncached":
+                claude._RATES.pop(a)                   # A must scan for itself, still not behind B
+            t = threading.Thread(target=look_a, args=(key,))
+            t.start()
+            t.join(30)
+            assert not t.is_alive(), f"a {key} lookup in store A waited for the scan of store B"
+            assert abs(got[key]["m"] - 2.0) < 1e-9, got
+        assert "b" not in got                          # B is still held
+    finally:
+        gate.set()
+        scan_b.join(60)
+        claude.last_line_with = real
+    assert abs(got["b"]["m"] - 3.0) < 1e-9
+    claude._RATES.clear()
+
+
+def test_a_rate_scan_that_did_not_complete_is_not_kept():
+    T = 1_700_000_000
+    # A store with no file at all (an unmounted drive, an empty glob) is retried.
+    empty = TMP / "emptystore" / "projects"
+    empty.mkdir(parents=True, exist_ok=True)
+    claude._RATES.clear()
+    assert claude.model_rates({"m"}, empty) == {} and empty not in claude._RATES
+    _cost_session(empty / "-p", "s", T, {"m": _usage(2.0)})
+    assert abs(claude.model_rates({"m"}, empty)["m"] - 2.0) < 1e-9 and empty in claude._RATES
+    # A scan the app's closing cut short is returned, not kept, and stops at the next file.
+    store = TMP / "stopstore" / "projects"
+    for i in range(3):
+        _cost_session(store / "-p", f"s{i}", T + i, {f"m{i}": _usage(2.0)})
+    real, seen = claude.last_line_with, []
+
+    def stopper(path, *a, **k):
+        seen.append(path)
+        claude.STOP.set()
+        return real(path, *a, **k)
+    claude.last_line_with = stopper
+    try:
+        claude.model_rates({"m0", "m1", "m2"}, store)
+    finally:
+        claude.last_line_with = real
+        claude.STOP.clear()
+    assert len(seen) == 1 and store not in claude._RATES, (len(seen), store in claude._RATES)
+    assert claude.model_rates({"m0", "m1", "m2"}, store).keys() == {"m0", "m1", "m2"}
+    assert store in claude._RATES
+    claude._RATES.clear()
+
+
 def test_pool_init_warms_in_the_background_and_scans_once():
     """The initializer returns at once (a preview that needs no rate does not
     wait for the scan); a preview that needs one waits on the scan in
-    progress instead of making a second."""
+    progress instead of making a second. The scan is held on an event, so the
+    test depends on no clock."""
     import threading
-    import time as _time
     store = HOME / ".claude" / "projects"
     nfiles = len(list(store.glob("*/*.jsonl")))
     claude._RATES.clear()
     real = claude.last_line_with
-    calls = []
+    calls, entered, gate = [], threading.Event(), threading.Event()
 
     def slow(*a, **k):
         calls.append(a[0])
-        _time.sleep(0.02)
+        entered.set()
+        gate.wait(60)
         return real(*a, **k)
     claude.last_line_with = slow
     try:
-        t0 = _time.monotonic()
         thread = cli._pool_init(os.getppid(), (str(store),))
         assert isinstance(thread, threading.Thread) and thread.daemon
-        assert _time.monotonic() - t0 < 0.1, "the initializer waited for the scan"
+        assert entered.wait(60), "the scan never started"
         # A preview with no cost (Codex) does not wait for it ...
-        t0 = _time.monotonic()
-        cli.preview(row(IDS["codex-cli-user"]), 100)
-        assert _time.monotonic() - t0 < 0.02 * nfiles / 2, "a non-cost preview waited for the scan"
+        out = []
+        t = threading.Thread(target=lambda: out.append(cli.preview(row(IDS["codex-cli-user"]), 100)))
+        t.start()
+        t.join(60)
+        assert not t.is_alive() and out, "a non-cost preview waited for the scan"
         assert thread.is_alive()
         # ... one that needs a rate gets it from the single scan.
+        gate.set()
         p = cli.preview(row(IDS["claude-live"]), 100)
         thread.join()
         assert "cost             ≈ $" in p, p
     finally:
+        gate.set()
         claude.last_line_with = real
     # nfiles scanned once, plus the live session's own cost-record read.
     assert len(calls) == nfiles + 1, (len(calls), nfiles)
@@ -767,6 +867,44 @@ def test_review_marking():
         cli.save_review({})
 
 
+def test_review_view_opens_with_the_cursor_on_screen():
+    """The Review view opens on an empty list ("scanning") and is then rebuilt
+    with the first unmarked row, 40 rows down: the cursor must be inside the
+    window although the list before it needed no scrollbar."""
+    rows, total = load()
+    fake = [dict(rows[0], id=f"rev{i:03d}", name=f"review row {i}", review=True, review_changes=True)
+            for i in range(92)]
+    import threading
+    gate = threading.Event()
+    real_rows = cli.review_rows
+    cli.review_rows = lambda sources: (gate.wait(60), (fake, []))[1]
+    cli.save_review({r["id"]: "accepted" for r in fake[:40]})
+    try:
+        async def drive():
+            app = cli.build_app(rows, "", False, total, False, discover())
+            async with app.run_test(size=(160, 30)) as p:
+                await p.pause()
+                lv = app.query_one("#list")
+                await p.press("f12")
+                await rebuilt(app, p)
+                await p.pause(0.2)                     # the empty "scanning" list is laid out
+                assert app.review_rows is None and not lv.lines
+                gate.set()
+                await until(p, lambda: app.review_rows is not None, "review scan")
+                await rebuilt(app, p)
+                await p.pause()
+                top, h = int(lv.scroll_offset.y), lv.scrollable_content_region.height
+                assert len(app._visible) == 92 and lv.index == 40, (len(app._visible), lv.index)
+                assert top <= lv.index < top + h, (top, lv.index, h)
+                await until(p, lambda: app._preview_key in app._previews, "preview")
+        asyncio.run(drive())
+        assert claude.STOP.is_set()                    # closing the app stops a rate scan
+    finally:
+        gate.set()
+        cli.review_rows = real_rows
+        cli.save_review({})
+
+
 def test_damaged_state_is_kept():
     """A damaged hidden/review file is moved aside and reported, never
     overwritten; an unreadable one raises instead of reading as empty."""
@@ -980,6 +1118,34 @@ def test_session_list_set_lines_set_line_and_hover():
             lv.hover = 1
             lv.set_lines(["a"], 0)
             assert lv.hover is None                      # a rebuild clears it
+            # The cursor row is inside the window even when the list before it
+            # fitted (no scrollbar yet): the scroll must not be skipped.
+            lv.set_lines([], 0)
+            lv.set_lines([f"r{i}" for i in range(100)], 50)
+            top = int(lv.scroll_offset.y)
+            assert top <= lv.index == 50 < top + lv.scrollable_content_region.height, (top, lv.index)
+            # The wheel moves the selection one row at a time.
+            lv.index = 3
+            lv.on_mouse_scroll_down(Wheel())
+            assert lv.index == 4
+            lv.on_mouse_scroll_up(Wheel())
+            assert lv.index == 3
+            # A cursor that scrolls the list away from the pointer drops the hover, either way.
+            lv.index = 0
+            lv.hover = 2
+            lv.index = 90
+            assert lv.hover is None
+            lv.hover = 85
+            lv.index = 10
+            assert lv.hover is None
+            # The list never takes focus: a click selects (here without resuming)
+            # and typing still goes to the search box.
+            lv.set_lines(["a", "b", "c"], 0)
+            with mock.patch.object(app, "action_resume") as resume:
+                await p.click("#list", offset=(4, 2))
+                await p.pause()
+            assert resume.called and app.focused is app.query_one("#search"), app.focused
+            await until(p, lambda: app._preview_key in app._previews, "preview")
             # Untrusted text: no control character reaches a screen line.
             lv.set_lines(["x\x1b[2Jy\nz\ttab\x07\x9b"], 0)
             lv.set_line(0, "q\x1b]0;title\x07r")
@@ -990,15 +1156,50 @@ def test_session_list_set_lines_set_line_and_hover():
     asyncio.run(drive())
 
 
-EVIL = "EVIL\x1b]0;PWNED\x07\x1b[2J\x9b31m‮ x⁦y"
+EVIL = ("EVIL\x1b]0;PWNED\x07\x1b[2J\x9b31m\N{RIGHT-TO-LEFT OVERRIDE} x\N{LEFT-TO-RIGHT ISOLATE}y"
+        "\N{ZERO WIDTH SPACE}\N{WORD JOINER}\N{ZERO WIDTH NO-BREAK SPACE}\N{SOFT HYPHEN}"
+        "\N{TAG LATIN CAPITAL LETTER A}\N{TAG LATIN SMALL LETTER B}\N{LEFT-TO-RIGHT MARK}")
+
+# Format characters a real script needs, which safe_text keeps: the joiners, the
+# Arabic, Syriac, Kaithi, Egyptian, shorthand and musical format marks.
+_KEPT_FORMAT = ({0x200C, 0x200D, 0x06DD, 0x070F, 0x08E2, 0x110BD, 0x110CD}
+                | set(range(0x600, 0x606)) | {0x890, 0x891} | set(range(0x13430, 0x13440))
+                | set(range(0x1BCA0, 0x1BCA4)) | set(range(0x1D173, 0x1D17B)))
 
 
 def _has_bad(text):
-    """True when `text` holds a control character, a line separator or a bidi
-    control (newline and tab are fine in a multi-line pane)."""
-    import re
-    return bool(re.search("[\x00-\x08\x0b-\x1f\x7f-\x9f  ‎‏؜"
-                          "‪-‮⁦-⁩]", text))
+    """True when `text` holds a control, format, separator or surrogate code
+    point, judged by the Unicode database and NOT by safe_text's own pattern
+    (a character both forget would otherwise never be found). Newline, tab and
+    the kept format characters are fine in a multi-line pane."""
+    import unicodedata
+    return any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp")
+               and c not in "\n\t" and ord(c) not in _KEPT_FORMAT for c in text)
+
+
+def test_safe_text_blanks_every_control_and_invisible_code_point():
+    import unicodedata
+    from hopback import fmt
+    blanked = 0
+    for cp in range(0x110000):
+        c = chr(cp)
+        if unicodedata.category(c) not in ("Cc", "Cf", "Cs", "Zl", "Zp") or cp in _KEPT_FORMAT:
+            continue
+        if c in "\n\t":
+            assert fmt.safe_text(c) == c and fmt.safe_text(c, line=True) == " ", cp
+        else:
+            assert fmt.safe_text(c) == " " and fmt.safe_text(c, line=True) == " ", hex(cp)
+            blanked += 1
+    assert blanked > 150, blanked
+    for cp in _KEPT_FORMAT | {0xFE0F, 0x1F600}:    # joiners, marks, a variation selector, an emoji
+        assert fmt.safe_text(chr(cp)) == chr(cp), hex(cp)
+    # A lone surrogate (valid JSON from a truncated emoji) would crash print().
+    lone = "a" + chr(0xD83D) + "b"
+    assert fmt.safe_text(lone) == "a b"
+    out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        cli.plain([{**_hostile_row(), "name": lone}], 1, [])
+    out.flush()
 
 
 def _fake_source(**fns):
@@ -1020,14 +1221,44 @@ def _hostile_row():
     return r
 
 
+class TTY(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def _run_main(*argv, chosen=None, sources=None, tty=True, foreign=()):
+    """cli.main() with the given command line; the picker returns `chosen`, and
+    neither the exec nor the chdir happens. Returns a namespace of the stdout
+    and stderr text (a SystemExit message goes on stderr) and the mocks."""
+    import types
+    err, out = TTY(), TTY()
+    with contextlib.ExitStack() as st:
+        for m in (mock.patch.object(sys, "argv", ["hopback", *argv]),
+                  mock.patch.object(sys, "stdin", TTY() if tty else io.StringIO()),
+                  mock.patch.object(sys, "stdout", out if tty else io.StringIO()),
+                  mock.patch.object(sys, "stderr", err),
+                  mock.patch.object(cli, "pick", return_value=(chosen, False))):
+            st.enter_context(m)
+        st.enter_context(mock.patch.object(cli, "foreign_owned", return_value=list(foreign)))
+        ex = st.enter_context(mock.patch.object(cli, "exec_agent"))
+        chdir = st.enter_context(mock.patch.object(os, "chdir"))
+        if sources is not None:
+            st.enter_context(mock.patch.object(cli, "discover", return_value=sources))
+        stdout = sys.stdout
+        try:
+            cli.main()
+        except SystemExit as exc:
+            err.write(str(exc.code or ""))
+        text = out.getvalue() if tty else stdout.getvalue()
+    return types.SimpleNamespace(out=text, err=err.getvalue(), exec=ex, chdir=chdir)
+
+
 def test_untrusted_text_reaches_no_sink_raw():
-    import contextlib
-    import io
-    from unittest import mock
     from hopback import fmt
     # The helper: the line variant also loses newline and tab; ZWJ stays (emoji).
     assert not _has_bad(fmt.safe_text(EVIL)) and not _has_bad(fmt.safe_text(EVIL, line=True))
-    assert fmt.safe_text("a\nb\t‍c") == "a\nb\t‍c"
+    assert _has_bad(EVIL) and _has_bad("a\N{ZERO WIDTH SPACE}b") and _has_bad("a" + chr(0xD83D))
+    assert fmt.safe_text("a\nb\t\N{ZERO WIDTH JOINER}c") == "a\nb\t\N{ZERO WIDTH JOINER}c"
     assert fmt.safe_text("a\nb\t", line=True) == "a b "
     bad = _hostile_row()
     # preview(): the final text, and its error string.
@@ -1039,17 +1270,29 @@ def test_untrusted_text_reaches_no_sink_raw():
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
         cli.plain([bad], 1, [])
     assert "EVIL" in out.getvalue() and not _has_bad(out.getvalue().replace("\n", " "))
-    # The launch command: a control character in the directory is refused (a
-    # changed path would cd somewhere else), a bidi mark is a real name and is
-    # passed on unchanged.
+    # The launch command. The real resume gets the exact directory (a CRLF
+    # script's directory ends in a CR, and was resumable before); only the
+    # printed command renders control, invisible and bidi characters, as
+    # $'\xNN' byte escapes that bash and zsh read back as the same bytes.
     src = row(IDS["claude-live"])["source"]
-    try:
-        src.launch({**bad, "source": src, "id": "abc"}, False)
-        raise AssertionError("a directory with an escape sequence was accepted")
+    _, cwd, shown = src.launch({**bad, "source": src, "id": "abc"}, False)
+    assert cwd == bad["cwd"] and "\x1b" in cwd
+    assert shown.startswith("cd $'/tmp/EVIL\\x1b]0;PWNED") and not _has_bad(shown), shown
+    rtl_dir = "/tmp/\N{HEBREW LETTER ALEF}\N{RIGHT-TO-LEFT EMBEDDING}x"
+    rtl = src.launch({**bad, "source": src, "id": "abc", "cwd": rtl_dir}, False)
+    assert rtl[1] == rtl_dir and "\N{HEBREW LETTER ALEF}" in rtl[2] and not _has_bad(rtl[2]), rtl[2]
+    try:                                            # no path holds a NUL, and exec cannot take one
+        src.launch({**bad, "source": src, "id": "abc", "cwd": "/tmp/a\x00b"}, False)
+        raise AssertionError("a NUL in the directory was accepted")
     except RuntimeError:
         pass
-    rtl = src.launch({**bad, "source": src, "id": "abc", "cwd": "/tmp/א‫x"}, False)
-    assert "א‫x" in rtl[1] or "א‫x" in rtl[2]
+    # A Hermes profile name travels in the command: it is rendered the same way.
+    import types
+    from hopback.sources import Source
+    hermes = types.SimpleNamespace(NAME="hermes", LABEL="Hermes", ASSISTANT="Hermes",
+                                   resume_cmd=lambda root, r, yolo: ["hermes", "-p", "pro\x1b[2Jfile", "--resume", r["id"]])
+    argv, _, shown = Source(paths.this_host(), hermes, HOME).launch({**bad, "id": "abc", "cwd": "/tmp"}, False)
+    assert argv[2] == "pro\x1b[2Jfile" and "$'pro\\x1b[2Jfile'" in shown and not _has_bad(shown), shown
 
     # The picker: the list, the loading line, the warnings box, the preview
     # once it arrives, and the notifications.
@@ -1076,36 +1319,105 @@ def test_untrusted_text_reaches_no_sink_raw():
             lv = app.query_one("#list")
             lv.set_lines([EVIL], 0)                      # no set_line after it
             assert not _has_bad("".join(s.text for s in lv.render_line(0)))
+            # Notifications: rendered as plain text (no control character), and
+            # never as markup, which would crash the toast or eat the text.
+            from textual.widgets._toast import Toast
             cli.STATE_PROBLEMS.append(EVIL)
             with mock.patch.object(app, "notify") as note:   # the toast layer is not in the strips
                 app.report_state()
             assert note.call_count == 1 and not _has_bad(note.call_args[0][0]), note.call_args
+            texts = ["boom [/oops] tail", "a[/]b", "[a b]", "path /home/u/[a b]/c",
+                     "[red]r[/red] [link=https://e.example]l[/link]", "[@click=app.quit_none]CLICK[/]"]
+            cli.STATE_PROBLEMS.extend(texts)
+            app.report_state()
+            await p.pause(0.2)
+            shown_texts = [Toast(n).render().plain for n in app._notifications]   # raises on markup errors
+            assert shown_texts[-len(texts):] == texts, shown_texts
+            app.warn("literal [/x]\x1b[2J", severity="error")
+            await p.pause(0.2)
+            last = [Toast(n).render().plain for n in app._notifications]
+            assert "literal [/x] [2J" in last, last
     asyncio.run(drive())
 
-    # main(): the line after the picker exits, the cwd warning, and --print-cd.
-    class TTY(io.StringIO):
-        def isatty(self):
-            return True
-
-    def run_main(chosen, *argv):
-        err, out = TTY(), TTY()
-        with mock.patch.object(sys, "argv", ["hopback", *argv]), \
-                mock.patch.object(sys, "stdin", TTY()), \
-                mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err), \
-                mock.patch.object(cli, "pick", return_value=(chosen, False)), \
-                mock.patch.object(os, "execvp") as ex, mock.patch.object(os, "chdir"):
-            try:
-                cli.main()
-            except SystemExit as exc:
-                err.write(str(exc.code or ""))
-        return out.getvalue(), err.getvalue(), ex
+    # main(): the line after the picker exits, the cwd warning, the foreign-owner
+    # message, and --print-cd.
     real = row(IDS["claude-live"])
-    _, err, ex = run_main({**real, "name": EVIL, "cwd": "/no/such/‮dir"})
-    assert "EVIL" in err and not _has_bad(err) and ex.called, err
-    _, err, ex = run_main({**real, "cwd": "/tmp/" + EVIL})        # refused, nothing run
-    assert "refusing" in err and not _has_bad(err) and not ex.called, err
-    out, err, ex = run_main({**real, "cwd": "/no/such/א"}, "--print-cd")
-    assert "א" in out and not ex.called, (out, err)          # printed exactly
+    res = _run_main(chosen={**real, "name": EVIL, "cwd": "/no/such/\N{RIGHT-TO-LEFT OVERRIDE}dir"})
+    assert "EVIL" in res.err and not _has_bad(res.err) and res.exec.called, res.err
+    res = _run_main(chosen={**real, "cwd": "/tmp/" + EVIL})        # resumed in the exact directory
+    assert not _has_bad(res.err) and res.exec.called, res.err
+    res = _run_main(chosen={**real, "cwd": "/tmp/a\x00b"})        # a NUL cannot be passed on: refused
+    assert "refusing" in res.err and not _has_bad(res.err) and not res.exec.called, res.err
+    res = _run_main("--print-cd", chosen={**real, "cwd": "/no/such/\N{HEBREW LETTER ALEF}"})
+    assert "\N{HEBREW LETTER ALEF}" in res.out and not res.exec.called, (res.out, res.err)
+    res = _run_main("--print-cd", chosen={**real, "cwd": "/no/such/dir\r\N{RIGHT-TO-LEFT OVERRIDE}"})
+    assert res.out.startswith("cd $'/no/such/dir\\x0d\\xe2\\x80\\xae' && claude --resume "), res.out
+    assert not _has_bad(res.out) and not res.exec.called
+    # A directory that really ends in a CR is resumed in exactly that directory.
+    crdir = TMP / "crdir\r"
+    crdir.mkdir()
+    res = _run_main(chosen={**real, "cwd": str(crdir)})
+    assert res.exec.called and res.chdir.call_args[0][0] == str(crdir), (res.err, res.chdir.call_args)
+    # The paths that "are not owned by you" are file names another user made.
+    here = Source(paths.this_host(), claude, HOME / ".claude" / "projects")
+    res = _run_main(chosen={**real, "source": here, "cwd": "/tmp"},
+                    foreign=["/tmp/claude-1/ev\x1b]0;x\x07\N{ZERO WIDTH SPACE}"])
+    assert "not owned by you" in res.err and not _has_bad(res.err) and not res.exec.called, res.err
+
+
+def test_id_lookup_and_doctor_reach_no_terminal_raw():
+    import types
+    from hopback.sources import Source
+    T = 1_700_000_000
+    root = TMP / "evilstore"
+    names = ["ev\x1b]0;PWNED\x07\x1b[2Ja", "ev\x1b]0;PWNED\x07\x1b[2Jb", "evok", "evok2"]
+    for n in names:
+        _cost_session(root / "projects" / "-p", n, T, {"m": _usage(2.0)})
+    src = Source(paths.this_host(), claude, root)
+    # A unique safe prefix prints exactly the id; ids launch() would refuse are no hits.
+    res = _run_main("--id", "evok2", sources=[src], tty=False)
+    assert res.out == "evok2\n" and not _has_bad(res.err), res
+    for prefix in ("evok", "ev"):                  # the two safe ids: listed on stderr
+        res = _run_main("--id", prefix, sources=[src], tty=False)
+        assert "2 sessions match" in res.err and "evok2" in res.err and not _has_bad(res.err), res.err
+    res = _run_main("--id", "ev\x1b", sources=[src], tty=False)
+    assert "no session id starts with" in res.err and not _has_bad(res.err) and res.out == "", res
+    # --preview of an unusual id: its error line shows the id as a repr.
+    res = _run_main("--preview", names[0], sources=[src], tty=False)
+    assert not _has_bad(res.err) and not _has_bad(res.out), (res.out, res.err)
+    with mock.patch.object(cli, "load_rows", return_value=([], 0, [])):    # found, but unreadable
+        res = _run_main("--preview", names[0], sources=[src], tty=False)
+    assert "could not be read" in res.err and not _has_bad(res.err), res.err
+    # --doctor: a store whose path, or whose error text, holds an escape sequence.
+    bad_root = Path("/no/such/p\x1b[2Jx")
+    broken = types.SimpleNamespace(NAME="hermes", LABEL="Hermes", count=mock.Mock(side_effect=OSError(EVIL)))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cli.doctor([Source(paths.this_host(), claude, bad_root), Source(paths.this_host(), broken, root)])
+    assert "p [2Jx" in out.getvalue() and "UNREADABLE" in out.getvalue(), out.getvalue()
+    assert not _has_bad(out.getvalue()), out.getvalue()
+
+
+def test_printed_command_round_trips_through_a_shell():
+    """The --print-cd output is read by bash or zsh, so every string must come
+    back byte for byte. The strings are fixed test data, never session data;
+    each is only quoted as one word and printed."""
+    import shutil as _sh
+    import subprocess
+    from hopback.fmt import shq
+    samples = ["plain", "with space", "it's", "back\\slash", "$(not run) `x` $HOME", "tab\there",
+               "cr\r", "esc\x1b[2J", "c1\x9b", "\N{RIGHT-TO-LEFT OVERRIDE}rlo", "\N{ZERO WIDTH SPACE}zw",
+               "\N{HEBREW LETTER ALEF}\N{RIGHT-TO-LEFT EMBEDDING}x", "\N{TAG LATIN CAPITAL LETTER A}",
+               "emoji \N{ZERO WIDTH JOINER} kept", "new\nline", "\\'\x01\\", "\N{GRINNING FACE} smile", "soft\N{SOFT HYPHEN}hyphen"]
+    for shell in ("bash", "zsh"):
+        exe = _sh.which(shell)
+        if not exe:
+            continue
+        for text in samples:
+            q = shq(text)
+            assert not _has_bad(q), (shell, q)
+            got = subprocess.run([exe, "-c", f"printf %s {q}"], capture_output=True, timeout=30)
+            assert got.returncode == 0 and got.stdout == text.encode(), (shell, text, q, got)
 
 
 def test_hiding_a_row_keeps_the_viewport():
@@ -1242,6 +1554,7 @@ if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             try:
+                setup_function()
                 fn()
                 print(f"ok    {name}")
             except Exception as exc:  # noqa: BLE001
