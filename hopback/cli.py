@@ -410,39 +410,134 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
-    from textual.widgets import Input, ListItem, ListView, Static, Tab, Tabs
+    from rich.segment import Segment
+    from rich.style import Style
+    from textual.geometry import Size
+    from textual.message import Message
+    from textual.scroll_view import ScrollView
+    from textual.strip import Strip
+    from textual.widgets import Input, Static, Tab, Tabs
 
     harnesses = [a for a in BY_NAME if any(s.adapter.NAME == a for s in sources)]
     hosts = sorted({s.host for s in sources}, key=lambda h: (h != this_host(), h))
 
-    class SessionList(ListView):
-        """ListView whose wheel changes the SELECTION rather than the viewport.
+    # Row colours: the old ListItem CSS (base, "alt" stripe, hover, highlight).
+    ROW_STYLE = Style(bgcolor="#16161e", color="#a9b1d6")
+    ROW_ALT = Style(bgcolor="#262b3d", color="#a9b1d6")
+    ROW_HOVER = Style(bgcolor="#343b58", color="#c0caf5")
+    ROW_HIGHLIGHT = Style(bgcolor="#3b4261", color="#ffc896", bold=True)
 
-        Scrolling the viewport under a stationary cursor means the highlighted
-        row silently becomes one you are not pointing at; moving the selection
-        keeps the wheel and the highlight talking about the same thing.
+    class SessionList(ScrollView):
+        """The session rows, painted line by line.
+
+        One widget per row (ListView) re-styles and re-lays-out every row on
+        each cursor move, tens of milliseconds even for a hundred rows.
+        Painting only the visible lines keeps a move to a couple of
+        milliseconds at any length. Never focused: typing always goes to the
+        search box, and the app's bindings move the cursor.
+
+        The wheel changes the SELECTION rather than the viewport: scrolling
+        under a stationary cursor means the highlighted row silently becomes
+        one you are not pointing at.
         """
+
+        can_focus = False
+
+        class Highlighted(Message):
+            pass
+
+        class Selected(Message):
+            pass
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.lines = []
+            self._index = None
+            self.hover = None
+
+        @property
+        def index(self):
+            return self._index
+
+        @index.setter
+        def index(self, value):
+            if not self.lines:
+                value = None
+            elif value is not None:
+                value = max(0, min(value, len(self.lines) - 1))
+            if value == self._index:
+                return
+            self._index = value
+            if value is not None:
+                top, h = int(self.scroll_offset.y), max(1, self.scrollable_content_region.height)
+                if value < top:
+                    self.scroll_to(y=value, animate=False, immediate=True)
+                elif value >= top + h:
+                    self.scroll_to(y=value - h + 1, animate=False, immediate=True)
+            self.refresh()
+            self.post_message(self.Highlighted())
+
+        def set_lines(self, lines, index):
+            """Replace every row; the cursor lands on `index` (clamped)."""
+            self.lines = lines
+            self.hover = None
+            self._index = None
+            self.virtual_size = Size(0, len(lines))
+            self.scroll_to(y=0, animate=False, immediate=True)
+            self.index = index if lines else None
+            self.refresh()
+
+        def set_line(self, i, text):
+            """Change one row's text in place; cursor and scroll stay."""
+            self.lines[i] = text
+            self.refresh()
+
+        def render_line(self, y):
+            width = self.scrollable_content_region.width
+            idx = y + int(self.scroll_offset.y)
+            if idx >= len(self.lines):
+                return Strip.blank(width, ROW_STYLE)
+            if idx == self._index:
+                style = ROW_HIGHLIGHT
+            elif idx == self.hover:
+                style = ROW_HOVER
+            else:
+                style = ROW_ALT if idx % 2 else ROW_STYLE
+            return Strip([Segment(" " + self.lines[idx], style)]).crop_extend(0, width, style)
+
+        def move(self, step):
+            self.index = 0 if self._index is None else self._index + step
+
+        def _row_at(self, event):
+            idx = event.y + int(self.scroll_offset.y)
+            return idx if 0 <= idx < len(self.lines) else None
 
         def on_mouse_scroll_down(self, event):
             event.prevent_default()
             event.stop()
-            self.action_cursor_down()
+            self.move(1)
 
         def on_mouse_scroll_up(self, event):
             event.prevent_default()
             event.stop()
-            self.action_cursor_up()
+            self.move(-1)
 
-    class Row(ListItem):
-        """One session. Carries its own alternation class so the CSS cascade,
-        not the text, decides its colour; that is what lets the focus and hover
-        rules override the stripe, which ANSI in fzf could never do."""
+        def on_mouse_move(self, event):
+            idx = self._row_at(event)
+            if idx != self.hover:
+                self.hover = idx
+                self.refresh()
 
-        def __init__(self, row, text, alt):
-            super().__init__(Static(text, markup=False))
-            self.row = row
-            if alt:
-                self.add_class("alt")
+        def on_leave(self, event):
+            if self.hover is not None:
+                self.hover = None
+                self.refresh()
+
+        def on_click(self, event):
+            idx = self._row_at(event)
+            if idx is not None:
+                self.index = idx
+                self.post_message(self.Selected())
 
     class SearchBox(Input):
         """In the review view, with the search box empty, the digits 0-3 mark
@@ -498,23 +593,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
         .controls { height: 1; padding-left: 2; }
         #keys { height: auto; }
         #labels { color: #7dcfff; height: 1; }
-        #list { background: #16161e; height: 1fr; scrollbar-size-vertical: 1; }
-        #list > ListItem { background: #16161e; color: #a9b1d6; padding: 0 1; }
-        /* Alternating rows. A later, equally specific rule still loses to the
-           more specific state selectors below, which is the whole point. */
-        #list > ListItem.alt { background: #262b3d; }
-        #list > ListItem.hovered,
-        #list > ListItem.-hovered,
-        #list > ListItem.alt.hovered,
-        #list > ListItem.alt.-hovered { background: #343b58; color: #c0caf5; }
-        #list > ListItem.-highlight,
-        #list > ListItem.alt.-highlight,
-        #list > ListItem.hovered.-highlight,
-        #list > ListItem.-hovered.-highlight,
-        #list > ListItem.alt.hovered.-highlight,
-        #list > ListItem.alt.-hovered.-highlight {
-            background: #3b4261; color: #ffc896; text-style: bold;
-        }
+        #list { background: #16161e; height: 1fr; overflow-x: hidden; scrollbar-size-vertical: 1; }
         #preview {
             height: 45%; border-top: solid #3a3a4a; background: #16161e;
             padding: 0 1; scrollbar-size-vertical: 1;
@@ -566,7 +645,6 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.left_text = ""
             self.host_text = ""
             self.head_text = ""
-            self._hover_idx = None
             self._previews = {}
             self._preview_key = None
             self._preview_timer = None
@@ -672,16 +750,15 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             return self._rebuild(self._refresh_ticket, keep_index)
 
         async def _rebuild(self, ticket, keep_index):
-            """Never cancelled part way: cancelling it inside ListView.clear()
-            or extend() left the list never settling and froze the picker
-            (measured 2026-10-08 with the Review scan returning at once). So
-            rebuilds queue on a lock, and one a newer request has overtaken
+            """Rebuilds queue on a lock, and one a newer request has overtaken
             returns at once: each reads the current state, so only the newest
-            needs to run."""
+            needs to run. (With the old ListView this was needed because
+            cancelling clear()/extend() part way froze the picker; set_lines
+            is synchronous now, so the lock is kept as a guard, not a need.)"""
             async with self._refresh_lock:
                 if ticket != self._refresh_ticket:
                     return
-                lv = self.query_one("#list", ListView)
+                lv = self.query_one("#list", SessionList)
                 self._visible = self.visible_rows()
                 if keep_index:
                     prev = lv.index
@@ -695,13 +772,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 if self.view_review:
                     namew += 4                     # room for the "[x] " mark fmt() puts in the column
                 self._namew = namew
-                self._hover_idx = None
-                await lv.clear()
-                items = [Row(r, fmt(r, namew, home, now), i % 2 == 1)
-                         for i, r in enumerate(self._visible)]
-                if items:
-                    await lv.extend(items)
-                    lv.index = min(prev or 0, len(items) - 1)
+                lv.set_lines([fmt(r, namew, home, now) for r in self._visible], prev or 0)
                 self._shown_ticket = ticket
                 self.update_header(namew)
                 self.update_preview()
@@ -810,7 +881,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             row the cursor has already left is dropped.
             """
             pane = self.query_one("#preview_body", Static)
-            lv = self.query_one("#list", ListView)
+            lv = self.query_one("#list", SessionList)
             if self._preview_timer:
                 self._preview_timer.stop()
             if not self._visible or lv.index is None:
@@ -892,52 +963,24 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 self.view_hidden = self.view_review = False
                 self.run_worker(self.refresh_rows(keep_index=False))
 
-        def on_list_view_highlighted(self, event):
+        def on_session_list_highlighted(self, event):
             self.update_preview()
 
-        def on_list_view_selected(self, event):
+        def on_session_list_selected(self, event):
             self.action_resume()
-
-        def on_mouse_move(self, event):
-            """Hover highlighting for rows.
-
-            ListView absorbs pointer events, so neither :hover nor Enter/Leave
-            ever reaches a row. Screen coordinates are mapped to a row index
-            instead: rows are one line tall, so the arithmetic is exact.
-            """
-            lv = self.query_one("#list", ListView)
-            region = lv.content_region
-            kids = list(lv.children)
-            idx = None
-            if (region.x <= event.screen_x < region.x + region.width
-                    and region.y <= event.screen_y < region.y + region.height):
-                idx = event.screen_y - region.y + int(lv.scroll_offset.y)
-                if not (0 <= idx < len(kids)):
-                    idx = None
-            if idx == self._hover_idx:
-                return
-            if self._hover_idx is not None and self._hover_idx < len(kids):
-                kids[self._hover_idx].remove_class("hovered")
-            self._hover_idx = idx
-            if idx is not None:
-                kids[idx].add_class("hovered")
 
         # -- actions ---------------------------------------------------------
         def action_cursor_down(self):
-            self.query_one("#list", ListView).action_cursor_down()
+            self.query_one("#list", SessionList).move(1)
 
         def action_cursor_up(self):
-            self.query_one("#list", ListView).action_cursor_up()
+            self.query_one("#list", SessionList).move(-1)
 
         def action_page_down(self):
-            lv = self.query_one("#list", ListView)
-            for _ in range(10):
-                lv.action_cursor_down()
+            self.query_one("#list", SessionList).move(10)
 
         def action_page_up(self):
-            lv = self.query_one("#list", ListView)
-            for _ in range(10):
-                lv.action_cursor_up()
+            self.query_one("#list", SessionList).move(-10)
 
         def action_clear_query(self):
             self.query_one("#search", Input).value = ""
@@ -1010,7 +1053,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
 
             Synchronous: the row, the counts and the cursor change before the
             next key is read, so marking quickly never drops or misplaces one."""
-            lv = self.query_one("#list", ListView)
+            lv = self.query_one("#list", SessionList)
             if not self.view_review:
                 return
             # Not while the scan is loading: the list on screen is not yet
@@ -1051,8 +1094,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             apply_review(self.all_rows, self.review)   # shows at once in the main list
             row["review_verdict"] = self.review.get(row["id"])
             row["review_mark"] = REVIEW_MARKS[row["review_verdict"]]
-            lv.children[i].query_one(Static).update(
-                fmt(row, self._namew, str(Path.home()), time.time()))
+            lv.set_line(i, fmt(row, self._namew, str(Path.home()), time.time()))
             self.update_header(self._namew)
             if i + 1 < len(self._visible):
                 lv.index = i + 1                       # the highlight event refreshes the preview
@@ -1060,10 +1102,9 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 self.update_preview()                  # same row, new verdict
 
         def on_key(self, event):
-            """The mark keys work wherever focus is: a click on a row or a tab
-            moves focus to the list, which ignores digits, and they bubble up
-            here. (The search box handles them itself, typing them once a
-            search has begun.)"""
+            """The mark keys work wherever focus is: should something other
+            than the search box hold it, digits bubble up to here. (The search
+            box handles them itself, typing them once a search has begun.)"""
             if (self.view_review and event.character in ("0", "1", "2", "3")
                     and not isinstance(self.focused, Input)):
                 event.stop()
@@ -1129,7 +1170,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             rebuild is requested until it is on screen: the cursor and the
             rows then belong to different lists, so acting would hit the
             wrong session."""
-            lv = self.query_one("#list", ListView)
+            lv = self.query_one("#list", SessionList)
             if self._shown_ticket != self._refresh_ticket:
                 self.notify("the list is updating, press again")
                 return None

@@ -563,9 +563,8 @@ def test_review_marking():
             app = cli.build_app(rows, "", False, total, False, discover())
             async with app.run_test(size=(160, 50)) as p:
                 await p.pause()
-                # Outside the Review view, digits never mark (list focused, too).
-                app.query_one("#list").focus()
-                await p.press("1")
+                # Outside the Review view, marking does nothing.
+                app.action_mark("accepted")
                 assert cli.load_review() == {ids[0]: "accepted"}
                 app.query_one("#search").focus()
                 await p.press("f12")
@@ -573,16 +572,18 @@ def test_review_marking():
                 await p.pause()
                 lv = app.query_one("#list")
                 assert lv.index == 1, lv.index             # the first unmarked
-                # With the list focused (a click on a row), digits still mark.
                 # Once a search has begun, digits type instead of marking.
                 await p.press("a", "1")
                 assert app.query_one("#search").value == "a1" and cli.load_review() == {ids[0]: "accepted"}
                 await p.press("ctrl+u")
                 await p.pause()
-                lv.focus()
                 lv.index = 1
                 await p.pause()
-                assert type(app.focused).__name__ == "SessionList", app.focused
+                # With something other than the search box focused (the tab
+                # bar), digits still mark: they bubble up to the app.
+                app.query_one("#tabs").focus()
+                await p.pause()
+                assert app.focused is not app.query_one("#search"), app.focused
                 await p.press("2")
                 assert cli.load_review().get(ids[1]) == "rejected", cli.load_review()
                 cli.save_review({ids[0]: "accepted"})
@@ -593,7 +594,7 @@ def test_review_marking():
                 await p.press("2", "3", "1")               # no pauses between keys
                 assert cli.load_review() == {ids[0]: "accepted", ids[1]: "rejected",
                                              ids[2]: "discuss", ids[3]: "accepted"}
-                assert lv.index == 4 and "[✗]" in str(lv.children[1].query_one("Static").render())
+                assert lv.index == 4 and "[✗]" in lv.lines[1]
 
                 def fail(_):
                     raise OSError("disk full")
@@ -742,6 +743,155 @@ def test_hiding_sessions():
             await press("ctrl+x")                  # unhide from the hidden view
             assert app._visible == [] and not cli.load_hidden()
     asyncio.run(drive())
+
+
+class Wheel:   # Pilot has no wheel; the handlers only need these
+    def prevent_default(self): pass
+    def stop(self): pass
+
+
+def test_session_list_cursor_wheel_page_click():
+    rows, total = load()
+
+    async def drive():
+        app = cli.build_app(rows, "", False, total, False, discover())
+        async with app.run_test(size=(150, 30)) as p:   # short: rows overflow
+            lv = app.query_one("#list")
+            await p.pause()
+            n = len(app._visible)
+            assert n > lv.scrollable_content_region.height, (n, "test needs overflow")
+            assert lv.index == 0 and len(lv.lines) == n
+            for _ in range(n + 3):
+                await p.press("down")
+            await p.pause()
+            assert lv.index == n - 1                     # clamped at the end
+            top = int(lv.scroll_offset.y)
+            assert top <= lv.index < top + lv.scrollable_content_region.height
+            await p.press("pageup")
+            assert lv.index == max(0, n - 11)
+            lv.index = n - 1
+            lv.on_mouse_scroll_up(Wheel())
+            await p.pause()
+            assert lv.index == n - 2                     # the wheel moves the selection
+            lv.on_mouse_scroll_down(Wheel())
+            assert lv.index == n - 1
+            await p.press("ctrl+k", "ctrl+j", "ctrl+k")  # the same moves from the search box
+            assert lv.index == n - 2
+            await p.press("pagedown")
+            assert lv.index == n - 1
+            assert app.focused is app.query_one("#search")
+            lv.index = 0
+            await p.pause()
+            assert int(lv.scroll_offset.y) == 0
+            await p.click("#list", offset=(5, 2))        # a click selects AND resumes
+            await p.pause()
+        return app
+
+    app = asyncio.run(drive())
+    assert app.result and app.result[0] is app._visible[2], "click did not resume row 2"
+
+
+def test_session_list_set_lines_set_line_and_hover():
+    rows, total = load()
+
+    async def drive():
+        app = cli.build_app(rows, "", False, total, False, discover())
+        async with app.run_test(size=(150, 40)) as p:
+            await p.pause()
+            lv = app.query_one("#list")
+            lv.set_lines([], 3)
+            assert lv.index is None                      # empty: no cursor
+            lv.set_lines(["a", "b", "c"], 2)
+            assert lv.index == 2
+            lv.set_lines(["a", "b"], 5)
+            assert lv.index == 1                         # clamped
+            lv.set_line(0, "changed")
+            assert lv.lines == ["changed", "b"] and lv.index == 1
+            plain = lambda y: "".join(s.text for s in lv.render_line(y)).rstrip()
+            assert plain(0) == " changed" and plain(5) == ""
+            # Colours: cursor, stripe, hover.
+            bg = lambda y: next(iter(lv.render_line(y))).style.bgcolor.name
+            assert bg(1) == "#3b4261" and bg(0) == "#16161e"
+            lv.set_lines(["a", "b", "c"], 0)
+            assert bg(1) == "#262b3d"
+            await p.hover("#list", offset=(4, 2))
+            await p.pause()
+            assert lv.hover == 2 and bg(2) == "#343b58"
+            await p.hover("#list", offset=(4, 9))        # below the last row
+            await p.pause()
+            assert lv.hover is None
+            lv.hover = 1
+            lv.set_lines(["a"], 0)
+            assert lv.hover is None                      # a rebuild clears it
+
+    asyncio.run(drive())
+
+
+def test_rebuild_refuses_actions_until_it_is_on_screen():
+    rows, total = load()
+
+    async def drive():
+        app = cli.build_app(rows, "", False, total, False, discover())
+        async with app.run_test(size=(150, 40)) as p:
+            await p.pause()
+            assert app._current() is not None
+            pending = app.refresh_rows()                 # requested, not yet on screen
+            assert app._shown_ticket != app._refresh_ticket
+            assert app._current() is None                # refused
+            app.action_resume()
+            assert app.result is None                    # ... so ENTER did nothing
+            await pending
+            assert app._shown_ticket == app._refresh_ticket
+            i, r = app._current()
+            assert r is app._visible[i]
+            # An overtaken rebuild returns without touching the list.
+            old = app.refresh_rows()
+            newest = app.refresh_rows()
+            before = app.query_one("#list").lines
+            await old
+            assert app.query_one("#list").lines is before
+            await newest
+            assert app._current() is not None
+            await p.pause()                              # let the cursor move settle before exit
+
+    asyncio.run(drive())
+
+
+def test_hidden_and_review_views_list_the_right_rows():
+    rows, total = load()
+    victim = rows[0]
+    cli.save_hidden({cli.hide_key(victim)})
+    fake = [dict(r, review=True, review_changes=True) for r in rows[:3]]
+    real = cli.review_rows
+    cli.review_rows = lambda sources: (fake, [])
+
+    async def drive():
+        app = cli.build_app(rows, "", False, total, False, discover())
+        async with app.run_test(size=(160, 50)) as p:
+            await p.pause()
+            lv = app.query_one("#list")
+            assert victim not in app._visible and len(lv.lines) == len(app._visible)
+            await p.click("#hiddentab")
+            await app.workers.wait_for_complete()
+            await p.pause()
+            assert app._visible == [victim] and len(lv.lines) == 1
+            assert victim["name"][:20] in lv.lines[0] and lv.index == 0
+            await p.press("f12")
+            await app.workers.wait_for_complete()
+            await p.pause()
+            assert app.view_review and len(lv.lines) == 3 == len(app._visible)
+            assert all(r["name"][:20] in ln for r, ln in zip(app._visible, lv.lines))
+            # Marking edits the shown line in place and moves the cursor on.
+            lv.index = 0
+            app.action_mark("rejected")
+            assert "[✗]" in lv.lines[0] and lv.index == 1
+            await p.pause()
+    try:
+        asyncio.run(drive())
+    finally:
+        cli.review_rows = real
+        cli.save_hidden(set())
+        cli.save_review({})
 
 
 if __name__ == "__main__":
