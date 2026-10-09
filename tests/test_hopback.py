@@ -247,6 +247,23 @@ def test_picker_controls():
     asyncio.run(drive())
 
 
+def test_model_rates_scans_a_store_once():
+    """From the desktop's perf-preview-cache branch: the rate scan is kept per store."""
+    store = HOME / ".claude" / "projects"
+    claude._RATES.clear()
+    calls = []
+    real = claude.last_line_with
+    claude.last_line_with = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        claude.model_rates({"no-such-model"}, store)
+        first = len(calls)
+        claude.model_rates({"no-such-model"}, store)
+        claude.model_rates({"another-missing-model"}, store)
+    finally:
+        claude.last_line_with = real
+    assert first and len(calls) == first, (first, len(calls))
+
+
 def test_shell_launch_parser():
     """The parser's own table of launches and look-alikes (hopback/shellparse.py)."""
     from hopback import shellparse
