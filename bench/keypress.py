@@ -22,6 +22,7 @@ is cold and a second is warm); otherwise the app's own preview code is used.
 """
 import argparse
 import asyncio
+import shutil
 import statistics
 import sys
 import tempfile
@@ -101,8 +102,20 @@ def main():
     ap.add_argument("--cache", help="previews.json to use (run twice: cold, then warm)")
     ap.add_argument("--no-cache", action="store_true", help="in-memory previewer only")
     args = ap.parse_args()
-    cache = args.cache or str(Path(tempfile.mkdtemp(prefix="hopback-bench-")) / "previews.json")
+    # A throwaway cache directory only where something uses it, removed on exit.
+    scratch = None
+    cache = args.cache
+    if not cache and previewcache is not None and not args.no_cache:
+        scratch = tempfile.mkdtemp(prefix="hopback-bench-")
+        cache = str(Path(scratch) / "previews.json")
+    try:
+        run(args, cache)
+    finally:
+        if scratch:
+            shutil.rmtree(scratch)
 
+
+def run(args, cache):
     sources = discover()
     t = time.perf_counter()
     rows, total, _ = cli.load_rows(sources, args.n, False, False, include_teams=True,
