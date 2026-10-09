@@ -4,7 +4,9 @@ Every function takes the store ROOT (the .claude directory) rather than reading
 a global, so one process can read several Claude stores, e.g. WSL and Windows.
 """
 import json
+import math
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -339,7 +341,7 @@ def first_prompt(path, max_lines=400):
 COST_MARK = b'"type":"cost-state"'
 
 
-def last_line_with(path, marker, chunk=4 * 1024 * 1024):
+def last_line_with(path, marker, chunk=4 * 1024 * 1024, errors=None):
     """(offset just past it, parsed record) of the LAST line containing marker.
 
     Reads backwards in chunks with no size limit, because a resumed session can
@@ -360,14 +362,15 @@ def last_line_with(path, marker, chunk=4 * 1024 * 1024):
                     b = len(buf) if b < 0 else b
                     try:
                         return start + b, json.loads(buf[a:b])
-                    except ValueError:
+                    except (ValueError, RecursionError):   # an unparsable line is no record
                         return None, None
                 # Keep a partial first line so a match split across chunks is found.
                 cut = buf.find(b"\n")
                 tail = buf[:cut] if cut >= 0 else buf
                 pos = start
-    except OSError:
-        pass
+    except OSError as exc:
+        if errors is not None and not isinstance(exc, PermissionError):
+            errors.append(exc)     # transient (EIO ...): the caller retries; a permission problem is permanent
     return None, None
 
 
@@ -439,29 +442,122 @@ def time_before(path, offset, span=256 * 1024):
     return None
 
 
+_RATES = {}  # store -> [(path, {model: rate}), ...], newest file first
+_RATES_GUARD = threading.Lock()   # guards _RATES_LOCKS only, never held during a scan
+_RATES_LOCKS = {}                 # store -> Lock held while that store is scanned
+STOP = threading.Event()          # set when the app closes: scans stop at the next file
+
+
+def _num(v):
+    """`v` if it is a finite number, else None: a cost record is data from disk."""
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    return v if ok else None
+
+
+_WEIGHTS = (("inputTokens", 1), ("outputTokens", 5), ("cacheReadInputTokens", 0.1),
+            ("cacheCreationInputTokens", 1.25))
+
+
+def _entry_rate(u):
+    """Dollars per weighted token from one modelUsage entry, or None when the
+    entry is malformed (not a dict, a token count or the cost null, a string,
+    NaN) or has no cost. A count that is absent counts as 0."""
+    if not isinstance(u, dict):
+        return None
+    cost = _num(u.get("costUSD"))
+    counts = [(_num(u[k]) if k in u else 0, wt) for k, wt in _WEIGHTS]
+    if cost is None or cost <= 0 or any(c is None for c, _ in counts):
+        return None
+    w = sum(c * wt for c, wt in counts)
+    return cost / w if w > 0 else None
+
+
+def _file_rates(store, max_files):
+    """Each recent file's per-model rates, read once per store per process.
+
+    Finding a rate means reading files backwards until a cost record turns up,
+    which for a store full of unexited sessions is hundreds of megabytes. That
+    is far too slow to repeat on every preview, so the scan is kept, misses
+    included. (From the desktop's perf-preview-cache branch, measured there:
+    a preview build went from a median 564 ms to about 85 ms.)
+
+    Known difference from the old per-call scan: the rates are read once per
+    process. A model first used after hopback started shows no rate (its live
+    sessions stay unpriced) until the next launch. The cache is also keyed on
+    the store alone, so the first caller's max_files wins (every caller uses 200).
+
+    A malformed model entry (null or non-numeric tokens, no dollars) gives no
+    rate for that model; a file that vanishes between the glob and the stat is
+    not a candidate; a line json cannot parse is no record. None of these stops
+    the other models or files. A scan cut short by STOP, or one that found no
+    file at all, or one that hit a transient read error (EIO, a failed listing), is
+    returned but not kept. A file we may not read (PermissionError) is permanent: it
+    counts as no record and the scan is kept, so one root-owned file cannot make every
+    preview rescan 200 files.
+    """
+    found = _RATES.get(store)       # lock-free: a stored list is never mutated
+    if found is not None:
+        return found
+    with _RATES_GUARD:
+        lock = _RATES_LOCKS.setdefault(store, threading.Lock())
+    with lock:                      # only a caller of the SAME store waits
+        if store in _RATES:
+            return _RATES[store]
+        dated, errors = [], []
+        try:
+            paths = list(store.glob("*/*.jsonl"))
+        except OSError as exc:     # an unlistable store: no files this time, retry later
+            errors.append(exc)
+            paths = []
+        for p in paths:
+            try:
+                dated.append((p.stat().st_mtime, p))
+            except OSError:        # deleted since the glob: not a candidate
+                continue
+        dated.sort(key=lambda d: d[0], reverse=True)
+        found = []
+        for _, path in dated[:max_files]:
+            if STOP.is_set():      # the app is closing: give up, cache nothing
+                return found
+            _, rec = last_line_with(path, COST_MARK, errors=errors)
+            usage = rec.get("modelUsage") if isinstance(rec, dict) else None
+            rates = {}
+            for model, u in (usage if isinstance(usage, dict) else {}).items():
+                rate = _entry_rate(u)
+                if rate is not None:
+                    rates[model] = rate
+            if rates:
+                found.append((path, rates))
+        # Cache a scan that saw files. A store with none (an unmounted drive, a
+        # glob that came back empty) may be a hiccup, so the next call retries;
+        # an empty store costs one glob to retry.
+        if dated and not errors:   # an unreadable listed file also means retry
+            _RATES[store] = found
+        return found
+
+
+def warm_rates(store, max_files=200):
+    """Read the rates now, so the first preview needn't (see _file_rates)."""
+    _file_rates(store, max_files)
+
+
 def model_rates(want, store, skip=None, max_files=200):
     """Price per weighted token for each model in `want`, measured from cost
     records that Claude Code itself wrote.
 
     No price table to go stale: a cost-state record carries tokens and dollars
-    per model, so the rate falls out of dividing one by the other. Searches the
-    most recent sessions until every wanted model is covered.
+    per model, so the rate falls out of dividing one by the other. Takes each
+    model's rate from the most recent session that has one.
     """
     rates = {}
-    files = sorted(store.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in files[:max_files]:
+    for path, found in _file_rates(store, max_files):
         if not want - rates.keys():
             break
         if path == skip:
             continue
-        _, rec = last_line_with(path, COST_MARK)
-        for model, u in ((rec or {}).get("modelUsage") or {}).items():
-            if model in want and model not in rates and u.get("costUSD"):
-                w = (u.get("inputTokens", 0) + 5 * u.get("outputTokens", 0)
-                     + 0.1 * u.get("cacheReadInputTokens", 0)
-                     + 1.25 * u.get("cacheCreationInputTokens", 0))
-                if w:
-                    rates[model] = u["costUSD"] / w
+        for model, rate in found.items():
+            if model in want and model not in rates:
+                rates[model] = rate
     return rates
 
 

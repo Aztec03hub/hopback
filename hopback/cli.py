@@ -13,8 +13,9 @@ through PowerShell, in its Windows directory.
 The UI is Textual rather than fzf. fzf applies its focus colours only where the
 row text does not already set its own, so alternating row colours and a uniform
 focused row are mutually exclusive there, and it has no mouse-motion events at
-all so nothing can highlight on hover. Textual's CSS cascade lets the focus rule
-override the stripe rule, and gives real :hover.
+all so nothing can highlight on hover. Textual paints the rows itself (a
+ScrollView, SessionList, that draws only the visible lines): the stripes, the
+uniform focused row and the hover colour are all set in render_line.
 
 Usage:
     hopback                       every session, every harness, every host
@@ -51,10 +52,10 @@ import sys
 import time
 from pathlib import Path
 
-from .adapters import AGENT, BY_NAME, LEFTOVER, ROLES, SCHEDULED
-from .fmt import size_str, when
+from .adapters import AGENT, BY_NAME, LEFTOVER, ROLES, SCHEDULED, claude
+from .fmt import safe_text, size_str, when
 from .paths import this_host
-from .sources import HOSTS, SRCW, discover
+from .sources import HOSTS, SAFE_ID, SRCW, discover
 
 DIRW = 44
 
@@ -101,13 +102,18 @@ def wrap_into(out, text, width, limit=None):
             out.append("  " + line)
 
 
+def show(widget, text):
+    """The one way text derived from a session or a store reaches a widget."""
+    widget.update(safe_text(text))
+
+
 def preview(row, width=80):
     """The preview pane for one row, the same shape for every harness."""
     src = row["source"]
     try:
         d = src.adapter.details(src.root, row["id"])
     except Exception as exc:  # noqa: BLE001
-        return f"could not read this session: {exc.__class__.__name__}: {exc}"
+        return safe_text(f"could not read this session: {exc.__class__.__name__}: {exc}")
     if d is None:
         return "session not found in its store (deleted since the list loaded?)"
     title = d["title"] if len(d["title"]) <= 200 else d["title"][:199] + "…"
@@ -157,7 +163,7 @@ def preview(row, width=80):
         else:
             out.append("  (no record)")
         out.append("")
-    return "\n".join(out)
+    return safe_text("\n".join(out))
 
 
 def show_path(row, home):
@@ -194,7 +200,7 @@ def plain(rows, total, sources):
     namew = min(max((len(r["name"]) for r in rows), default=4), 40)
     print(header(namew) + "  ID")
     for r in rows:
-        print(fmt(r, namew, home, now) + f'  {r["id"]}')
+        print(safe_text(fmt(r, namew, home, now) + f'  {r["id"]}', line=True))
     print(f'\n{len(rows)} shown, {total} sessions in {len(sources)} stores'
           f'   · = named by you, ? = directory not recorded or inferred', file=sys.stderr)
     print("resume one:  hopback --print-cd <id or words>   (or run hopback for the picker)",
@@ -387,16 +393,36 @@ def _exit_with_parent(parent):
     threading.Thread(target=watch, daemon=True).start()
 
 
-def preview_pool():
+def _pool_init(parent, stores):
+    """Each worker watches its parent and, on a daemon thread, reads the cost
+    rates of every store once (the scan is per process, and would otherwise
+    cost the first preview that needs a rate a second or two). It is a thread
+    so the worker takes jobs at once: a preview that needs no rate does not
+    wait, and one that does waits on the scan's lock rather than scanning
+    again. Returns the thread (the pool ignores it)."""
+    import threading
+    _exit_with_parent(parent)
+
+    def warm():
+        for store in stores:
+            claude.warm_rates(Path(store))
+    thread = threading.Thread(target=warm, name="hopback-warm-rates", daemon=True)
+    thread.start()
+    return thread
+
+
+def preview_pool(stores=()):
     """Worker processes for the preview pane, started before Textual takes over
     stdio (spawning afterwards fails on its replaced file descriptors). spawn,
-    not fork: forking a process that runs threads can deadlock the child."""
+    not fork: forking a process that runs threads can deadlock the child.
+    `stores`: the Claude project directories whose cost rates the workers read
+    as they start."""
     import concurrent.futures
     import multiprocessing
     try:
         pool = concurrent.futures.ProcessPoolExecutor(
             max_workers=2, mp_context=multiprocessing.get_context("spawn"),
-            initializer=_exit_with_parent, initargs=(os.getpid(),))
+            initializer=_pool_init, initargs=(os.getpid(), tuple(str(s) for s in stores)))
         for _ in range(2):
             pool.submit(int)   # start both workers now, while startup is under way
     except (OSError, ImportError, NotImplementedError, ValueError):
@@ -410,39 +436,139 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
-    from textual.widgets import Input, ListItem, ListView, Static, Tab, Tabs
+    from rich.segment import Segment
+    from rich.style import Style
+    from textual.geometry import Size
+    from textual.message import Message
+    from textual.scroll_view import ScrollView
+    from textual.strip import Strip
+    from textual.widgets import Input, Static, Tab, Tabs
 
     harnesses = [a for a in BY_NAME if any(s.adapter.NAME == a for s in sources)]
     hosts = sorted({s.host for s in sources}, key=lambda h: (h != this_host(), h))
 
-    class SessionList(ListView):
-        """ListView whose wheel changes the SELECTION rather than the viewport.
+    # Row colours: the old ListItem CSS (base, "alt" stripe, hover, highlight).
+    ROW_STYLE = Style(bgcolor="#16161e", color="#a9b1d6")
+    ROW_ALT = Style(bgcolor="#262b3d", color="#a9b1d6")
+    ROW_HOVER = Style(bgcolor="#343b58", color="#c0caf5")
+    ROW_HIGHLIGHT = Style(bgcolor="#3b4261", color="#ffc896", bold=True)
 
-        Scrolling the viewport under a stationary cursor means the highlighted
-        row silently becomes one you are not pointing at; moving the selection
-        keeps the wheel and the highlight talking about the same thing.
+    class SessionList(ScrollView):
+        """The session rows, painted line by line.
+
+        One widget per row (ListView) re-styles and re-lays-out every row on
+        each cursor move, tens of milliseconds even for a hundred rows.
+        Painting only the visible lines keeps a move to a couple of
+        milliseconds at any length. Never focused: typing always goes to the
+        search box, and the app's bindings move the cursor.
+
+        The wheel changes the SELECTION rather than the viewport: scrolling
+        under a stationary cursor means the highlighted row silently becomes
+        one you are not pointing at.
         """
+
+        can_focus = False
+
+        class Highlighted(Message):
+            pass
+
+        class Selected(Message):
+            pass
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.lines = []
+            self._index = None
+            self.hover = None
+
+        @property
+        def index(self):
+            return self._index
+
+        @index.setter
+        def index(self, value):
+            if not self.lines:
+                value = None
+            elif value is not None:
+                value = max(0, min(value, len(self.lines) - 1))
+            if value == self._index:
+                return
+            self._index = value
+            if value is not None:
+                top, h = int(self.scroll_offset.y), max(1, self.scrollable_content_region.height)
+                if value < top:
+                    self.scroll_to(y=value, animate=False, immediate=True, force=True)
+                    self.hover = None      # the pointer is over another row now
+                elif value >= top + h:
+                    self.scroll_to(y=value - h + 1, animate=False, immediate=True, force=True)
+                    self.hover = None      # (the next mouse move sets it again)
+            self.refresh()
+            self.post_message(self.Highlighted())
+
+        def set_lines(self, lines, index, keep_scroll=False):
+            """Replace every row; the cursor lands on `index` (clamped). With
+            `keep_scroll` the viewport stays where it was (as far as the new
+            length allows) instead of going back to the top."""
+            top = int(self.scroll_offset.y)
+            self.lines = [safe_text(t, line=True) for t in lines]
+            self.hover = None
+            self._index = None
+            self.virtual_size = Size(0, len(lines))
+            self.scroll_to(y=top if keep_scroll else 0, animate=False, immediate=True, force=True)
+            self.index = index if lines else None
+            self.refresh()
+
+        def set_line(self, i, text):
+            """Change one row's text in place; cursor and scroll stay."""
+            self.lines[i] = safe_text(text, line=True)
+            self.refresh()
+
+        def render_line(self, y):
+            width = self.scrollable_content_region.width
+            idx = y + int(self.scroll_offset.y)
+            if idx >= len(self.lines):
+                return Strip.blank(width, ROW_STYLE)
+            if idx == self._index:
+                style = ROW_HIGHLIGHT
+            elif idx == self.hover:
+                style = ROW_HOVER
+            else:
+                style = ROW_ALT if idx % 2 else ROW_STYLE
+            return Strip([Segment(" " + self.lines[idx], style)]).crop_extend(0, width, style)
+
+        def move(self, step):
+            self.index = 0 if self._index is None else self._index + step
+
+        def _row_at(self, event):
+            idx = event.y + int(self.scroll_offset.y)
+            return idx if 0 <= idx < len(self.lines) else None
 
         def on_mouse_scroll_down(self, event):
             event.prevent_default()
             event.stop()
-            self.action_cursor_down()
+            self.move(1)
 
         def on_mouse_scroll_up(self, event):
             event.prevent_default()
             event.stop()
-            self.action_cursor_up()
+            self.move(-1)
 
-    class Row(ListItem):
-        """One session. Carries its own alternation class so the CSS cascade,
-        not the text, decides its colour; that is what lets the focus and hover
-        rules override the stripe, which ANSI in fzf could never do."""
+        def on_mouse_move(self, event):
+            idx = self._row_at(event)
+            if idx != self.hover:
+                self.hover = idx
+                self.refresh()
 
-        def __init__(self, row, text, alt):
-            super().__init__(Static(text, markup=False))
-            self.row = row
-            if alt:
-                self.add_class("alt")
+        def on_leave(self, event):
+            if self.hover is not None:
+                self.hover = None
+                self.refresh()
+
+        def on_click(self, event):
+            idx = self._row_at(event)
+            if idx is not None:
+                self.index = idx
+                self.post_message(self.Selected())
 
     class SearchBox(Input):
         """In the review view, with the search box empty, the digits 0-3 mark
@@ -498,23 +624,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
         .controls { height: 1; padding-left: 2; }
         #keys { height: auto; }
         #labels { color: #7dcfff; height: 1; }
-        #list { background: #16161e; height: 1fr; scrollbar-size-vertical: 1; }
-        #list > ListItem { background: #16161e; color: #a9b1d6; padding: 0 1; }
-        /* Alternating rows. A later, equally specific rule still loses to the
-           more specific state selectors below, which is the whole point. */
-        #list > ListItem.alt { background: #262b3d; }
-        #list > ListItem.hovered,
-        #list > ListItem.-hovered,
-        #list > ListItem.alt.hovered,
-        #list > ListItem.alt.-hovered { background: #343b58; color: #c0caf5; }
-        #list > ListItem.-highlight,
-        #list > ListItem.alt.-highlight,
-        #list > ListItem.hovered.-highlight,
-        #list > ListItem.-hovered.-highlight,
-        #list > ListItem.alt.hovered.-highlight,
-        #list > ListItem.alt.-hovered.-highlight {
-            background: #3b4261; color: #ffc896; text-style: bold;
-        }
+        #list { background: #16161e; height: 1fr; overflow-x: hidden; scrollbar-size-vertical: 1; }
         #preview {
             height: 45%; border-top: solid #3a3a4a; background: #16161e;
             padding: 0 1; scrollbar-size-vertical: 1;
@@ -566,11 +676,11 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.left_text = ""
             self.host_text = ""
             self.head_text = ""
-            self._hover_idx = None
             self._previews = {}
             self._preview_key = None
             self._preview_timer = None
-            self._pool = preview_pool()
+            self._pool = preview_pool(sorted({str(s.root / "projects") for s in sources
+                                              if s.adapter is claude}))
             self.hidden = load_hidden()
             self.view_hidden = start_hidden
             self.review = load_review()
@@ -601,7 +711,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                     yield Clickable("show_review", id="reviewtab",
                                     classes="" if start_review else "hidden")
                 yield Static("", id="head", markup=False)
-                yield Static("\n".join(warnings), id="warn", markup=False,
+                yield Static(safe_text("\n".join(warnings)), id="warn", markup=False,
                              classes="" if warnings else "hidden")
                 with Horizontal(id="controls", classes="controls"):
                     yield Clickable("cycle_host", id="hosts", classes="control")
@@ -624,13 +734,21 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                     yield Static("", id="preview_body", markup=False)
 
         async def on_mount(self):
+            claude.STOP.clear()
             await self.refresh_rows()
             self.query_one("#search", Input).focus()
             self.report_state()
             if self.review_on:
                 self.action_show_review()
 
+        def warn(self, text, **kw):
+            """The one way to show a notification: the text is shown exactly as
+            given (no markup, no control characters), whatever a path or an
+            error message contains."""
+            self.notify(safe_text(text), markup=False, **kw)
+
         def on_unmount(self):
+            claude.STOP.set()      # a rate scan in the thread fallback ends at its next file
             # Kill, not just shut down: ENTER execs the agent straight after
             # this, and a worker mid-preview would outlive hopback inside it.
             if self._pool:
@@ -672,16 +790,15 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             return self._rebuild(self._refresh_ticket, keep_index)
 
         async def _rebuild(self, ticket, keep_index):
-            """Never cancelled part way: cancelling it inside ListView.clear()
-            or extend() left the list never settling and froze the picker
-            (measured 2026-10-08 with the Review scan returning at once). So
-            rebuilds queue on a lock, and one a newer request has overtaken
+            """Rebuilds queue on a lock, and one a newer request has overtaken
             returns at once: each reads the current state, so only the newest
-            needs to run."""
+            needs to run. (With the old ListView this was needed because
+            cancelling clear()/extend() part way froze the picker; set_lines
+            is synchronous now, so the lock is kept as a guard, not a need.)"""
             async with self._refresh_lock:
                 if ticket != self._refresh_ticket:
                     return
-                lv = self.query_one("#list", ListView)
+                lv = self.query_one("#list", SessionList)
                 self._visible = self.visible_rows()
                 if keep_index:
                     prev = lv.index
@@ -695,13 +812,8 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 if self.view_review:
                     namew += 4                     # room for the "[x] " mark fmt() puts in the column
                 self._namew = namew
-                self._hover_idx = None
-                await lv.clear()
-                items = [Row(r, fmt(r, namew, home, now), i % 2 == 1)
-                         for i, r in enumerate(self._visible)]
-                if items:
-                    await lv.extend(items)
-                    lv.index = min(prev or 0, len(items) - 1)
+                lv.set_lines([fmt(r, namew, home, now) for r in self._visible], prev or 0,
+                             keep_scroll=keep_index)
                 self._shown_ticket = ticket
                 self.update_header(namew)
                 self.update_preview()
@@ -810,7 +922,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             row the cursor has already left is dropped.
             """
             pane = self.query_one("#preview_body", Static)
-            lv = self.query_one("#list", ListView)
+            lv = self.query_one("#list", SessionList)
             if self._preview_timer:
                 self._preview_timer.stop()
             if not self._visible or lv.index is None:
@@ -825,13 +937,13 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self._preview_key = key
             cached = self._previews.get(key)
             if cached:
-                pane.update(cached[1])
+                show(pane, cached[1])
                 # A live session keeps growing: show what we have at once, and
                 # re-read it in the background if that is more than 10 s old.
                 if time.time() - cached[0] < 10:
                     return
             else:
-                pane.update(f"{row['name']}\n\n  loading…")
+                show(pane, f"{row['name']}\n\n  loading…")
             # Debounce: holding an arrow key fires one read for the row it
             # stops on, not one per row passed. exclusive: moving on cancels a
             # read that hasn't started, so the row you stop on isn't queued
@@ -855,13 +967,13 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                     text = await loop.run_in_executor(None, preview, row, width)
                 except Exception as exc:  # noqa: BLE001
                     if key == self._preview_key:
-                        self.query_one("#preview_body", Static).update(
-                            f"could not read this session: {exc.__class__.__name__}: {exc}")
+                        show(self.query_one("#preview_body", Static),
+                             f"could not read this session: {exc.__class__.__name__}: {exc}")
                     return      # not cached: the next visit tries again
             except Exception as exc:  # noqa: BLE001
-                text = f"could not read this session: {exc.__class__.__name__}: {exc}"
+                text = safe_text(f"could not read this session: {exc.__class__.__name__}: {exc}")
                 if key == self._preview_key:
-                    self.query_one("#preview_body", Static).update(text)
+                    show(self.query_one("#preview_body", Static), text)
                 return          # not cached: the next visit tries again
             self.show_preview(key, text)
 
@@ -870,7 +982,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 self._previews.clear()
             self._previews[key] = (time.time(), text)
             if key == self._preview_key:
-                self.query_one("#preview_body", Static).update(text)
+                show(self.query_one("#preview_body", Static), text)
 
         # -- events ----------------------------------------------------------
         def on_input_submitted(self, event):
@@ -892,52 +1004,24 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 self.view_hidden = self.view_review = False
                 self.run_worker(self.refresh_rows(keep_index=False))
 
-        def on_list_view_highlighted(self, event):
+        def on_session_list_highlighted(self, event):
             self.update_preview()
 
-        def on_list_view_selected(self, event):
+        def on_session_list_selected(self, event):
             self.action_resume()
-
-        def on_mouse_move(self, event):
-            """Hover highlighting for rows.
-
-            ListView absorbs pointer events, so neither :hover nor Enter/Leave
-            ever reaches a row. Screen coordinates are mapped to a row index
-            instead: rows are one line tall, so the arithmetic is exact.
-            """
-            lv = self.query_one("#list", ListView)
-            region = lv.content_region
-            kids = list(lv.children)
-            idx = None
-            if (region.x <= event.screen_x < region.x + region.width
-                    and region.y <= event.screen_y < region.y + region.height):
-                idx = event.screen_y - region.y + int(lv.scroll_offset.y)
-                if not (0 <= idx < len(kids)):
-                    idx = None
-            if idx == self._hover_idx:
-                return
-            if self._hover_idx is not None and self._hover_idx < len(kids):
-                kids[self._hover_idx].remove_class("hovered")
-            self._hover_idx = idx
-            if idx is not None:
-                kids[idx].add_class("hovered")
 
         # -- actions ---------------------------------------------------------
         def action_cursor_down(self):
-            self.query_one("#list", ListView).action_cursor_down()
+            self.query_one("#list", SessionList).move(1)
 
         def action_cursor_up(self):
-            self.query_one("#list", ListView).action_cursor_up()
+            self.query_one("#list", SessionList).move(-1)
 
         def action_page_down(self):
-            lv = self.query_one("#list", ListView)
-            for _ in range(10):
-                lv.action_cursor_down()
+            self.query_one("#list", SessionList).move(10)
 
         def action_page_up(self):
-            lv = self.query_one("#list", ListView)
-            for _ in range(10):
-                lv.action_cursor_up()
+            self.query_one("#list", SessionList).move(-10)
 
         def action_clear_query(self):
             self.query_one("#search", Input).value = ""
@@ -1001,7 +1085,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self._review_loading = False
             self.review_rows = rows
             for p in problems:
-                self.notify(p, severity="error", timeout=30)
+                self.warn(p, severity="error", timeout=30)
             if self.view_review:
                 self.run_worker(self.refresh_rows(keep_index=False))
 
@@ -1010,13 +1094,13 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
 
             Synchronous: the row, the counts and the cursor change before the
             next key is read, so marking quickly never drops or misplaces one."""
-            lv = self.query_one("#list", ListView)
+            lv = self.query_one("#list", SessionList)
             if not self.view_review:
                 return
             # Not while the scan is loading: the list on screen is not yet
             # the review list, so the mark would land on the wrong session.
             if self.review_rows is None:
-                self.notify("still scanning: nothing marked yet")
+                self.warn("still scanning: nothing marked yet")
                 return
             cur = self._current()
             if cur is None:
@@ -1045,14 +1129,13 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 except OSError as exc:
                     failed = exc
             if failed is not None:
-                self.notify(f"couldn't save the verdict ({failed}); kept here, saved with the next mark",
+                self.warn(f"couldn't save the verdict ({failed}); kept here, saved with the next mark",
                             severity="warning")
             self.report_state()
             apply_review(self.all_rows, self.review)   # shows at once in the main list
             row["review_verdict"] = self.review.get(row["id"])
             row["review_mark"] = REVIEW_MARKS[row["review_verdict"]]
-            lv.children[i].query_one(Static).update(
-                fmt(row, self._namew, str(Path.home()), time.time()))
+            lv.set_line(i, fmt(row, self._namew, str(Path.home()), time.time()))
             self.update_header(self._namew)
             if i + 1 < len(self._visible):
                 lv.index = i + 1                       # the highlight event refreshes the preview
@@ -1060,10 +1143,9 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 self.update_preview()                  # same row, new verdict
 
         def on_key(self, event):
-            """The mark keys work wherever focus is: a click on a row or a tab
-            moves focus to the list, which ignores digits, and they bubble up
-            here. (The search box handles them itself, typing them once a
-            search has begun.)"""
+            """The mark keys work wherever focus is: should something other
+            than the search box hold it, digits bubble up to here. (The search
+            box handles them itself, typing them once a search has begun.)"""
             if (self.view_review and event.character in ("0", "1", "2", "3")
                     and not isinstance(self.focused, Input)):
                 event.stop()
@@ -1073,7 +1155,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
         def report_state(self):
             """Show (once) what went wrong reading saved state."""
             while STATE_PROBLEMS:
-                self.notify(STATE_PROBLEMS.pop(0), severity="warning", timeout=30)
+                self.warn(STATE_PROBLEMS.pop(0), severity="warning", timeout=30)
 
         def action_show_hidden(self):
             if self.view_hidden:
@@ -1086,7 +1168,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
 
         def action_toggle_hide(self):
             if self.view_review:
-                self.notify("leave the Review view to hide sessions")
+                self.warn("leave the Review view to hide sessions")
                 return
             cur = self._current()
             if cur is None:
@@ -1099,7 +1181,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             try:
                 fresh = load_hidden()
             except OSError as exc:             # unreadable: never save over it
-                self.notify(f"couldn't read the hidden list ({exc}); nothing changed", severity="error")
+                self.warn(f"couldn't read the hidden list ({exc}); nothing changed", severity="error")
                 return
             # Found damaged and set aside: keep what this picker holds.
             self.hidden = fresh | self.hidden if len(STATE_PROBLEMS) > seen else fresh
@@ -1111,7 +1193,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             try:
                 save_hidden(self.hidden)
             except OSError as exc:
-                self.notify(f"couldn't save the hidden list ({exc}); it lasts until you quit",
+                self.warn(f"couldn't save the hidden list ({exc}); it lasts until you quit",
                             severity="warning")
             self.run_worker(self.refresh_rows())
 
@@ -1129,9 +1211,9 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             rebuild is requested until it is on screen: the cursor and the
             rows then belong to different lists, so acting would hit the
             wrong session."""
-            lv = self.query_one("#list", ListView)
+            lv = self.query_one("#list", SessionList)
             if self._shown_ticket != self._refresh_ticket:
-                self.notify("the list is updating, press again")
+                self.warn("the list is updating, press again")
                 return None
             if not self._visible or lv.index is None:
                 return None
@@ -1191,7 +1273,7 @@ def doctor(sources):
             n = f"{src.adapter.count(src.root):,} sessions"
         except Exception as exc:  # noqa: BLE001
             n = f"UNREADABLE: {exc}"
-        print(f"  {src.tag:<{SRCW}} {str(src.root):<48} {n}")
+        print(safe_text(f"  {src.tag:<{SRCW}} {str(src.root):<48} {n}", line=True))
     mode = "picker" if sys.stdin.isatty() and sys.stdout.isatty() else "list"
     print(f"\nwould use   {mode}")
     if mode == "list":
@@ -1269,16 +1351,16 @@ def main():
         for src in scoped:
             try:
                 hits += [(src, i) for i in src.adapter.ids(src.root)
-                         if i == want or (args.id and i.startswith(want))]
+                         if i == want or (args.id and i.startswith(want) and SAFE_ID.fullmatch(i))]
             except Exception as exc:  # noqa: BLE001 - one bad store mustn't hide the others
-                print(f"{src.tag}: could not read {src.root} ({exc.__class__.__name__}: {exc})",
-                      file=sys.stderr)
+                print(safe_text(f"{src.tag}: could not read {src.root} "
+                                f"({exc.__class__.__name__}: {exc})", line=True), file=sys.stderr)
         if not hits:
             sys.exit(f"no session id {'starts with' if args.id else 'is'} {want!r}")
         if len(hits) > 1 and args.id:
             print(f"{len(hits)} sessions match {want!r}:", file=sys.stderr)
             for src, i in hits[:10]:
-                print(f"  {src.tag:<{SRCW}} {i}", file=sys.stderr)
+                print(safe_text(f"  {src.tag:<{SRCW}} {i}", line=True), file=sys.stderr)
             sys.exit(1)
         src, sid = hits[0]
         if args.id:
@@ -1287,10 +1369,10 @@ def main():
         rows, _, warns = load_rows([src], None, False, False, include_teams=True,
                                    include_scratch=True, include_empty=True, include_archived=True)
         for w in warns:
-            print(f"warning: {w}", file=sys.stderr)
+            print(safe_text(f"warning: {w}", line=True), file=sys.stderr)
         row = next((r for r in rows if r["id"] == sid), None)
         if row is None:
-            sys.exit(f"session {sid} could not be read")
+            sys.exit(f"session {sid!r} could not be read")
         print(preview(row, args.preview_width))
         return
 
@@ -1306,7 +1388,7 @@ def main():
         include_archived=args.archived,
         limit_counts_visible=load_skipped and not (args.teams and args.scheduled and args.background))
     for w in warnings:
-        print(f"warning: {w}", file=sys.stderr)
+        print(safe_text(f"warning: {w}", line=True), file=sys.stderr)
     if not rows:
         sys.exit("no sessions found")
     try:
@@ -1318,7 +1400,7 @@ def main():
 
     if not interactive:
         while STATE_PROBLEMS:
-            print(f"warning: {STATE_PROBLEMS.pop(0)}", file=sys.stderr)
+            print(safe_text(f"warning: {STATE_PROBLEMS.pop(0)}", line=True), file=sys.stderr)
         apply_review(rows, load_review())
         hid = load_hidden()
         rows = [r for r in rows if (hide_key(r) in hid) == args.hidden
@@ -1329,7 +1411,13 @@ def main():
             sys.exit("no matching sessions")
         if args.print_cd:
             # Non-interactive resume: the newest match, printed, not run.
-            print(rows[0]["source"].launch(rows[0], args.yolo)[2])
+            # The output is read by a shell, so a path is never altered: launch()
+            # quotes it, and a control or invisible character comes out as a
+            # $'\xNN' escape that bash and zsh read back as the same bytes.
+            try:
+                print(rows[0]["source"].launch(rows[0], args.yolo)[2])
+            except RuntimeError as exc:
+                sys.exit(safe_text(str(exc), line=True))
             return
         plain(rows, total, scoped)
         return
@@ -1344,13 +1432,13 @@ def main():
     try:
         argv, target, shown = src.launch(chosen, yolo)
     except RuntimeError as exc:
-        sys.exit(str(exc))
+        sys.exit(safe_text(str(exc), line=True))
 
     # An inferred or missing path must not be guessed into: chdir'ing into the
     # wrong tree would resume the session against it. Stay put and say so.
     if not target or not Path(target).is_dir():
-        print(f"warning: {target or '(no directory)'} does not exist here; "
-              f"resuming from {Path.cwd()}", file=sys.stderr)
+        print(safe_text(f"warning: {target or '(no directory)'} does not exist here; "
+                        f"resuming from {Path.cwd()}", line=True), file=sys.stderr)
         target = str(Path.cwd())
 
     if args.print_cd:
@@ -1358,19 +1446,32 @@ def main():
         return
 
     tag = "  [skip-permissions]" if yolo else ""
-    print(f"→ {chosen['name']}  ({src.label}){tag}", file=sys.stderr)
+    print(safe_text(f"→ {chosen['name']}  ({src.label}){tag}", line=True), file=sys.stderr)
     if src.adapter.NAME == "claude" and src.host == this_host() and hasattr(os, "getuid"):
         tmp = Path(os.environ.get("CLAUDE_CODE_TMPDIR") or "/tmp") / f"claude-{os.getuid()}"
         bad = foreign_owned(tmp)
         if bad:
             conf = Path("/etc/tmpfiles.d/claude.conf")
-            sys.exit(f"claude will refuse to start: these paths under {tmp} are not owned by you:\n  "
-                     + "\n  ".join(bad[:20])
+            # The paths are file names someone else created: render them, as lines.
+            sys.exit(f"claude will refuse to start: these paths under {safe_text(str(tmp), line=True)} "
+                     "are not owned by you:\n  "
+                     + "\n  ".join(safe_text(b, line=True) for b in bad[:20])
                      + (f"\n  ... and {len(bad) - 20} more" if len(bad) > 20 else "")
                      + "\nUsually a Docker bind mount recreated them as root. Fix: sudo rm -rf "
                        "the listed paths"
                      + (f", then run: sudo systemd-tmpfiles --create {conf}" if conf.exists() else ""))
     os.chdir(target)
+    exec_agent(argv)
+
+
+def exec_agent(argv):
+    """Replace hopback with the agent. exec skips Python's exit handlers, so the
+    preview pool's semaphores would stay registered with multiprocessing's
+    resource tracker; it outlives the exec and, when the agent exits, prints
+    "There appear to be 5 leaked semaphore objects". Run multiprocessing's own
+    exit handler first, which unlinks them and lets the tracker go quietly."""
+    from multiprocessing import util
+    util._exit_function()  # pyright: ignore[reportAttributeAccessIssue]
     try:
         os.execvp(argv[0], argv)
     except OSError as exc:

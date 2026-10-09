@@ -7,12 +7,12 @@ WSL laptop show up together, each labelled with where it came from.
 """
 import os
 import re
-import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
 from .adapters import ADAPTERS
+from .fmt import safe_text, shq
 from .paths import is_win_path, powershell, ps_quote, this_host, to_local, windows_home
 
 SAFE_ID = re.compile(r"[\w.:-]+")
@@ -58,6 +58,12 @@ class Source:
         # rather than passed to a shell or to PowerShell.
         if not SAFE_ID.fullmatch(row["id"]):
             raise RuntimeError(f"refusing to resume an unusual session id: {row['id']!r}")
+        # No path or argument holds a NUL, and one cannot be passed to chdir or
+        # exec. Other control and invisible characters are real (a directory made
+        # by a CRLF script ends in \r) and are resumed as they are; only the
+        # printed command (`shown`) renders them as $'\xNN' escapes.
+        if any("\x00" in (a or "") for a in (cwd, *argv)):
+            raise RuntimeError(f"refusing to resume with a NUL in the directory or command: {cwd!r}")
         if self.host == "win" and this_host() == "wsl":
             ps = powershell()
             if not ps:
@@ -75,11 +81,12 @@ class Source:
             script += "& " + " ".join(ps_quote(a) for a in argv)
             local = to_local(win_cwd) if win_cwd else None
             run_in = local if local and Path(local).is_dir() else "/mnt/c"
-            shown = f"[Windows] {'cd ' + win_cwd + ' && ' if win_cwd else ''}{' '.join(argv)}"
+            shown = safe_text(f"[Windows] {'cd ' + win_cwd + ' && ' if win_cwd else ''}{' '.join(argv)}",
+                              line=True)
             return [ps, "-NoLogo", "-NoProfile", "-Command", script], run_in, shown
-        shown = " ".join(shlex.quote(a) for a in argv)
+        shown = " ".join(shq(a) for a in argv)
         if cwd:
-            shown = f"cd {shlex.quote(cwd)} && {shown}"
+            shown = f"cd -- {shq(cwd)} && {shown}"
         return argv, cwd, shown
 
 

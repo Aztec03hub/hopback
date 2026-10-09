@@ -106,7 +106,8 @@ hopback --review              open on the Review view (also F12): check every sp
 hopback -s / -e / --archived  include /tmp, empty, archived sessions
 hopback --deep                read whole Claude files (slower, finds early-only titles)
 hopback --id <prefix>         print the full id for a prefix, then exit
-hopback --print-cd            print the resume command instead of running it
+hopback --print-cd            print the resume command instead of running it (a path with control
+                              characters is written as $'...': for bash, zsh and ksh)
 hopback --doctor              list every store found and why the picker did or didn't appear
 claude-sessions               the old command: Claude Code sessions only
 ```
@@ -161,9 +162,9 @@ Earlier versions only searched the last 4 MB of a file for the cost record, and 
 Every reply in a transcript records its token usage: input, output, cache reads, and 5-minute and 1-hour cache writes. The estimate adds up the usage since the last cost record. It counts each API response once, even though it's written as several records, and it includes the session's **subagent** transcripts, because subagent spend is billed to the parent. The total is then priced like this:
 
 - The price ratios between token types come from Anthropic's published pricing structure: output costs 5× input, cache reads 0.1×, 5-minute cache writes 1.25× and 1-hour cache writes 2×.
-- The **base price per model is measured, not hard-coded.** It's derived from the session's own earlier cost record, or failing that, from the newest cost record on disk that used the same model. There's no price table to go out of date.
+- The **base price per model is measured, not hard-coded.** It's derived from the session's own earlier cost record, or failing that, from the newest cost record among your 200 most recent sessions that used the same model. Those records are read once, when hopback starts: a model first used after that shows no estimate until the next launch. There's no price table to go out of date.
 
-Back-tested on real sessions by estimating each cost record from the one before it, the median error was about **6.5%**, slightly low on average. A few sessions were far off, probably because of spend the transcript doesn't record. Treat `≈` as a good ballpark, not an invoice. If no cost record on disk has ever used a session's model, no estimate is shown.
+Back-tested on real sessions by estimating each cost record from the one before it, the median error was about **6.5%**, slightly low on average. A few sessions were far off, probably because of spend the transcript doesn't record. Treat `≈` as a good ballpark, not an invoice. If none of those 200 sessions has a cost record for a session's model, no estimate is shown.
 
 ### Why does Codex show tokens but no cost?
 
@@ -217,4 +218,4 @@ The tests build the same fake multi-agent, multi-host store as the screenshots a
 
 ## Why Textual (and not fzf)
 
-The first version was a plain Python list printer. Next it became an fzf front end, and then it was rewritten in Textual, because fzf only applies its focus colours where the row text doesn't set its own colours. That makes alternating row stripes and a uniformly highlighted focused row mutually exclusive, and fzf has no mouse-motion events, so hover highlighting is impossible. Textual's CSS cascade lets the focus and hover rules override the stripe rule, and it allows full colour theming.
+The first version was a plain Python list printer. Next it became an fzf front end, and then it was rewritten in Textual, because fzf only applies its focus colours where the row text doesn't set its own colours. That makes alternating row stripes and a uniformly highlighted focused row mutually exclusive, and fzf has no mouse-motion events, so hover highlighting is impossible. Textual has mouse-motion events, and the list is a widget that paints its own visible rows (SessionList), so the stripes, the uniform focused row and the hover colour are all set in one place and can't fight each other.
