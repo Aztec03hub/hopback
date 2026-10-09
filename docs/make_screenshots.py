@@ -54,6 +54,17 @@ def select(app, pred):
     lv.index = next(i for i, r in enumerate(app._visible) if pred(r))
 
 
+async def rebuilt(app, pilot):
+    """Wait for the newest list rebuild. Not app.workers.wait_for_complete(): it
+    gathers the preview worker too, which the app cancels itself, and the
+    gather then raises WorkerCancelled."""
+    for _ in range(500):
+        await pilot.pause(0.01)
+        if app._shown_ticket == app._refresh_ticket:
+            return
+    raise AssertionError("rebuild never finished")
+
+
 async def shoot(name, keys=(), query="", hover=None, pick=None):
     sources = discover()
     rows, total, _ = cli.load_rows(sources, 300, False, False, include_teams=True,
@@ -63,11 +74,11 @@ async def shoot(name, keys=(), query="", hover=None, pick=None):
         await pilot.pause()
         for k in keys:
             await pilot.press(k)
-            await app.workers.wait_for_complete()
+            await rebuilt(app, pilot)
             await pilot.pause()
         if pick:
             select(app, pick)
-        await app.workers.wait_for_complete()
+        await rebuilt(app, pilot)
         if hover:
             await pilot.hover("#list", offset=hover)
         await pilot.pause(0.3)

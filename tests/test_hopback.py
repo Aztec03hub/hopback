@@ -32,6 +32,21 @@ from hopback.sources import discover  # noqa: E402
 IDS = demo_store.build(HOME, WIN)
 
 
+async def until(p, cond, what, tries=500):
+    """Poll `cond` with the pilot's clock. Not app.workers.wait_for_complete():
+    that gathers the preview worker too, which the app cancels itself when a
+    newer rebuild starts one, and the gather then raises WorkerCancelled."""
+    for _ in range(tries):
+        await p.pause(0.01)
+        if cond():
+            return
+    raise AssertionError(f"{what} never finished")
+
+
+async def rebuilt(app, p):
+    await until(p, lambda: app._shown_ticket == app._refresh_ticket, "rebuild")
+
+
 def load(**kw):
     opts = dict(include_teams=True, include_scratch=True, limit_counts_visible=True)
     opts.update(kw)
@@ -218,7 +233,7 @@ def test_picker_controls():
             async def press(*keys):
                 # Filters refresh in a worker; wait for it, or the asserts race it.
                 await p.press(*keys)
-                await app.workers.wait_for_complete()
+                await rebuilt(app, p)
                 await p.pause()
 
             await p.pause()
@@ -237,7 +252,7 @@ def test_picker_controls():
             await press("ctrl+t")
             assert any(r["role"] == "team" for r in app._visible)
             await p.click("#sched")
-            await app.workers.wait_for_complete()
+            await rebuilt(app, p)
             assert not app.show_scheduled
             from textual.widgets import Input
             # A fuzzy query over random temp paths can match anything; the id is exact.
@@ -245,6 +260,25 @@ def test_picker_controls():
             await p.pause()
             assert [r["id"] for r in app._visible] == [IDS["hermes-d-cli"]], app._visible
     asyncio.run(drive())
+
+
+def _cost_session(proj, name, mtime, models, extra=None):
+    """A session file whose last line is a cost-state record; `models` maps a
+    model to its modelUsage entry. Returns the path."""
+    import json
+    proj.mkdir(parents=True, exist_ok=True)
+    path = proj / f"{name}.jsonl"
+    recs = [{"type": "user", "cwd": "/x", "message": {"role": "user", "content": "hi"}},
+            {"type": "cost-state", "totalCostUSD": 1.0, "modelUsage": models}] + (extra or [])
+    path.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in recs))
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def _usage(rate, tokens=100):
+    """Output tokens weigh 5, so the weighted tokens are 5 * tokens: cost = rate * that."""
+    return {"inputTokens": 0, "outputTokens": tokens, "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0, "costUSD": rate * 5 * tokens}
 
 
 def test_model_rates_scans_a_store_once():
@@ -273,6 +307,98 @@ def test_model_rates_scans_a_store_once():
     finally:
         claude.last_line_with = real
     assert warmed and len(calls) == warmed
+
+
+def test_model_rates_values_and_selection_rules():
+    store = TMP / "ratestore" / "projects"
+    proj = store / "-p"
+    T = 1_700_000_000
+    older = _cost_session(proj, "older", T, {"m": _usage(2.0), "only-old": _usage(7.0)})
+    newer = _cost_session(proj, "newer", T + 100, {"m": _usage(4.0), "zero": _usage(0.0)})
+    # The weights are in/out/cache-read/cache-write = 1 / 5 / 0.1 / 1.25.
+    mixed = _cost_session(proj, "mixed", T - 100, {"w": {
+        "inputTokens": 10, "outputTokens": 10, "cacheReadInputTokens": 100,
+        "cacheCreationInputTokens": 8, "costUSD": 80.0 * 3}})
+    claude._RATES.clear()
+    near = lambda got, want: abs(got - want) < 1e-9
+    r = claude.model_rates({"m", "only-old", "zero", "w", "absent"}, store)
+    assert near(r["m"], 4.0), r                       # the newer file wins
+    assert near(r["only-old"], 7.0) and near(r["w"], 3.0), r   # weighted tokens 10+50+10+10 = 80
+    assert "zero" not in r and "absent" not in r, r   # costUSD 0 is no rate
+    r = claude.model_rates({"m"}, store, skip=newer)
+    assert near(r["m"], 2.0), r                       # skip: that file does not count
+    claude._RATES.clear()
+    r = claude.model_rates({"m", "only-old"}, store, max_files=1)
+    assert near(r["m"], 4.0) and "only-old" not in r, r   # max_files=1: the newest file only
+    claude._RATES.clear()
+
+
+def test_model_rates_survive_malformed_records_and_vanished_files():
+    store = TMP / "badratestore" / "projects"
+    proj = store / "-p"
+    T = 1_700_000_000
+    _cost_session(proj, "good", T, {"opus": _usage(2.0)})
+    _cost_session(proj, "bad", T + 100, {
+        "other": {"inputTokens": None, "outputTokens": 3, "costUSD": 0.5},
+        "text": {"inputTokens": "9", "outputTokens": "x", "costUSD": "1"},
+        "list": [1, 2],
+        "nan": {"inputTokens": float("nan"), "outputTokens": 1, "costUSD": 1.0},
+        "opus": _usage(5.0)})
+    _cost_session(proj, "notdict", T + 200, [1, 2, 3])
+    (proj / "gone.jsonl").symlink_to(proj / "no-such-target")   # globbed, then stat fails
+    claude._RATES.clear()
+    r = claude.model_rates({"opus", "other", "text", "list", "nan"}, store)
+    assert r.keys() == {"opus"} and abs(r["opus"] - 5.0) < 1e-9, r   # a bad entry costs only itself
+    # The worker initializer cannot raise on such data either.
+    claude._RATES.clear()
+    cli._pool_init(os.getppid(), (str(store),)).join()
+    assert store in claude._RATES
+    claude._RATES.clear()
+
+
+def test_pool_init_warms_in_the_background_and_scans_once():
+    """The initializer returns at once (a preview that needs no rate does not
+    wait for the scan); a preview that needs one waits on the scan in
+    progress instead of making a second."""
+    import threading
+    import time as _time
+    store = HOME / ".claude" / "projects"
+    nfiles = len(list(store.glob("*/*.jsonl")))
+    claude._RATES.clear()
+    real = claude.last_line_with
+    calls = []
+
+    def slow(*a, **k):
+        calls.append(a[0])
+        _time.sleep(0.02)
+        return real(*a, **k)
+    claude.last_line_with = slow
+    try:
+        t0 = _time.monotonic()
+        thread = cli._pool_init(os.getppid(), (str(store),))
+        assert isinstance(thread, threading.Thread) and thread.daemon
+        assert _time.monotonic() - t0 < 0.1, "the initializer waited for the scan"
+        # A preview with no cost (Codex) does not wait for it ...
+        t0 = _time.monotonic()
+        cli.preview(row(IDS["codex-cli-user"]), 100)
+        assert _time.monotonic() - t0 < 0.02 * nfiles / 2, "a non-cost preview waited for the scan"
+        assert thread.is_alive()
+        # ... one that needs a rate gets it from the single scan.
+        p = cli.preview(row(IDS["claude-live"]), 100)
+        thread.join()
+        assert "cost             ≈ $" in p, p
+    finally:
+        claude.last_line_with = real
+    # nfiles scanned once, plus the live session's own cost-record read.
+    assert len(calls) == nfiles + 1, (len(calls), nfiles)
+    claude._RATES.clear()
+    # preview_pool hands the workers the stores to warm.
+    pool = cli.preview_pool([store])
+    if pool is not None:
+        try:
+            assert pool._initargs[1] == (str(store),), pool._initargs
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def test_shell_launch_parser():
@@ -546,7 +672,8 @@ def test_review_view_while_loading():
                 await p.press("1")
                 await p.pause(0.2)
                 assert cli.load_review() == {}
-                await app.workers.wait_for_complete()
+                await until(p, lambda: app.review_rows is not None, "review scan")
+                await rebuilt(app, p)
                 await p.pause()
                 assert app.review_rows == [] and app.view_review
         asyncio.run(drive())
@@ -579,7 +706,7 @@ def test_review_marking():
                 assert cli.load_review() == {ids[0]: "accepted"}
                 app.query_one("#search").focus()
                 await p.press("f12")
-                await app.workers.wait_for_complete()
+                await rebuilt(app, p)
                 await p.pause()
                 lv = app.query_one("#list")
                 assert lv.index == 1, lv.index             # the first unmarked
@@ -728,7 +855,7 @@ def test_hiding_sessions():
         async with app.run_test(size=(160, 50)) as p:
             async def press(*keys):
                 await p.press(*keys)
-                await app.workers.wait_for_complete()
+                await rebuilt(app, p)
                 await p.pause()
 
             await p.pause()
@@ -740,7 +867,7 @@ def test_hiding_sessions():
             label = str(app.query_one("#tabs", Tabs).query_one("#t-all").label)
             assert "(+1 hidden)" in label, label
             await p.click("#hiddentab")
-            await app.workers.wait_for_complete()
+            await rebuilt(app, p)
             await p.pause()
             assert app.view_hidden and app._visible == [victim]
             assert app.query_one("#tabs", Tabs).active == ""
@@ -794,12 +921,23 @@ def test_session_list_cursor_wheel_page_click():
             lv.index = 0
             await p.pause()
             assert int(lv.scroll_offset.y) == 0
+            # Page up at the top clamps to row 0 (and the preview follows).
+            lv.index = 2
+            await p.press("pageup")
+            await p.pause()
+            assert lv.index == 0 and app._current()[1] is app._visible[0]
+            # Scrolled: a click resumes top + y, not row y.
+            for _ in range(lv.scrollable_content_region.height + 2):
+                await p.press("down")
+            await p.pause()
+            top = int(lv.scroll_offset.y)
+            assert top > 0, top
             await p.click("#list", offset=(5, 2))        # a click selects AND resumes
             await p.pause()
-        return app
+        return app, top
 
-    app = asyncio.run(drive())
-    assert app.result and app.result[0] is app._visible[2], "click did not resume row 2"
+    app, top = asyncio.run(drive())
+    assert app.result and app.result[0] is app._visible[top + 2], "click did not resume row top+2"
 
 
 def test_session_list_set_lines_set_line_and_hover():
@@ -831,6 +969,14 @@ def test_session_list_set_lines_set_line_and_hover():
             await p.hover("#list", offset=(4, 9))        # below the last row
             await p.pause()
             assert lv.hover is None
+            lv.set_lines(["a", "b", "c"], 2)
+            lv.hover = 2
+            assert bg(2) == "#3b4261"                    # the cursor row wins over hover
+            lv.hover = 1
+            assert bg(1) == "#343b58" and bg(2) == "#3b4261"
+            assert bg(10) == "#16161e"                   # a blank row carries the row style
+            lv.on_leave(None)
+            assert lv.hover is None                      # the pointer left the list
             lv.hover = 1
             lv.set_lines(["a"], 0)
             assert lv.hover is None                      # a rebuild clears it
@@ -841,6 +987,164 @@ def test_session_list_set_lines_set_line_and_hover():
             assert cli.safe_text("a\x1b[0mb\nc\td") == "a [0mb\nc\td" and cli.safe_text("a\nb\t", line=True) == "a b "
             await p.pause()
 
+    asyncio.run(drive())
+
+
+EVIL = "EVIL\x1b]0;PWNED\x07\x1b[2J\x9b31m‮ x⁦y"
+
+
+def _has_bad(text):
+    """True when `text` holds a control character, a line separator or a bidi
+    control (newline and tab are fine in a multi-line pane)."""
+    import re
+    return bool(re.search("[\x00-\x08\x0b-\x1f\x7f-\x9f  ‎‏؜"
+                          "‪-‮⁦-⁩]", text))
+
+
+def _fake_source(**fns):
+    """A Claude-shaped source whose adapter functions are overridden by `fns`."""
+    import types
+    from hopback.sources import Source
+    fake = types.SimpleNamespace(NAME="claude", LABEL="Claude Code", ASSISTANT="Claude",
+                                 resume_cmd=claude.resume_cmd, **fns)
+    return Source("wsl", fake, HOME / ".claude" / "projects")
+
+
+def _hostile_row():
+    """A row whose every field carries EVIL, on an adapter whose details do too."""
+    src = _fake_source(details=lambda root, sid: {
+        "title": EVIL, "fields": [("cwd", EVIL)], "prompt": EVIL, "reply": EVIL,
+        "opening": EVIL})
+    r = dict(row(IDS["claude-live"]))
+    r.update(source=src, name=EVIL, cwd="/tmp/" + EVIL, id="hostile")
+    return r
+
+
+def test_untrusted_text_reaches_no_sink_raw():
+    import contextlib
+    import io
+    from unittest import mock
+    from hopback import fmt
+    # The helper: the line variant also loses newline and tab; ZWJ stays (emoji).
+    assert not _has_bad(fmt.safe_text(EVIL)) and not _has_bad(fmt.safe_text(EVIL, line=True))
+    assert fmt.safe_text("a\nb\t‍c") == "a\nb\t‍c"
+    assert fmt.safe_text("a\nb\t", line=True) == "a b "
+    bad = _hostile_row()
+    # preview(): the final text, and its error string.
+    assert not _has_bad(cli.preview(bad, 100))
+    boom = _fake_source(details=mock.Mock(side_effect=OSError(EVIL)))
+    assert not _has_bad(cli.preview({**bad, "source": boom}))
+    # plain() (hopback -l).
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        cli.plain([bad], 1, [])
+    assert "EVIL" in out.getvalue() and not _has_bad(out.getvalue().replace("\n", " "))
+    # The launch command: a control character in the directory is refused (a
+    # changed path would cd somewhere else), a bidi mark is a real name and is
+    # passed on unchanged.
+    src = row(IDS["claude-live"])["source"]
+    try:
+        src.launch({**bad, "source": src, "id": "abc"}, False)
+        raise AssertionError("a directory with an escape sequence was accepted")
+    except RuntimeError:
+        pass
+    rtl = src.launch({**bad, "source": src, "id": "abc", "cwd": "/tmp/א‫x"}, False)
+    assert "א‫x" in rtl[1] or "א‫x" in rtl[2]
+
+    # The picker: the list, the loading line, the warnings box, the preview
+    # once it arrives, and the notifications.
+    rows, total = load()
+
+    def screen_text(app):
+        return "\n".join(s.text for s in app.screen._compositor.render_strips())
+
+    async def drive():
+        app = cli.build_app([bad] + rows, "", False, total + 1, False, discover(),
+                            warnings=[EVIL])
+        async with app.run_test(size=(160, 50)) as p:
+            await p.pause()
+            assert "EVIL" in screen_text(app) and not _has_bad(screen_text(app))
+            app._previews.clear()
+            app._preview_key = None
+            app.update_preview()                         # "loading…" for the hostile row
+            await p.pause()
+            assert "loading" in screen_text(app) or app._previews
+            assert not _has_bad(screen_text(app)), "loading line"
+            await until(p, lambda: app._previews, "preview")
+            await p.pause()
+            assert "EVIL" in screen_text(app) and not _has_bad(screen_text(app)), "preview"
+            lv = app.query_one("#list")
+            lv.set_lines([EVIL], 0)                      # no set_line after it
+            assert not _has_bad("".join(s.text for s in lv.render_line(0)))
+            cli.STATE_PROBLEMS.append(EVIL)
+            with mock.patch.object(app, "notify") as note:   # the toast layer is not in the strips
+                app.report_state()
+            assert note.call_count == 1 and not _has_bad(note.call_args[0][0]), note.call_args
+    asyncio.run(drive())
+
+    # main(): the line after the picker exits, the cwd warning, and --print-cd.
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    def run_main(chosen, *argv):
+        err, out = TTY(), TTY()
+        with mock.patch.object(sys, "argv", ["hopback", *argv]), \
+                mock.patch.object(sys, "stdin", TTY()), \
+                mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(cli, "pick", return_value=(chosen, False)), \
+                mock.patch.object(os, "execvp") as ex, mock.patch.object(os, "chdir"):
+            try:
+                cli.main()
+            except SystemExit as exc:
+                err.write(str(exc.code or ""))
+        return out.getvalue(), err.getvalue(), ex
+    real = row(IDS["claude-live"])
+    _, err, ex = run_main({**real, "name": EVIL, "cwd": "/no/such/‮dir"})
+    assert "EVIL" in err and not _has_bad(err) and ex.called, err
+    _, err, ex = run_main({**real, "cwd": "/tmp/" + EVIL})        # refused, nothing run
+    assert "refusing" in err and not _has_bad(err) and not ex.called, err
+    out, err, ex = run_main({**real, "cwd": "/no/such/א"}, "--print-cd")
+    assert "א" in out and not ex.called, (out, err)          # printed exactly
+
+
+def test_hiding_a_row_keeps_the_viewport():
+    rows, total = load()
+
+    async def drive():
+        app = cli.build_app(rows, "", False, total, False, discover())
+        async with app.run_test(size=(150, 30)) as p:
+            await p.pause()
+            lv = app.query_one("#list")
+            for _ in range(lv.scrollable_content_region.height + 3):
+                await p.press("down")
+            for _ in range(3):
+                await p.press("up")                      # the cursor mid-window, not at an edge
+            await p.pause()
+            top, index, n = int(lv.scroll_offset.y), lv.index, len(app._visible)
+            assert top > 0 and index > top, (top, index)
+            await p.press("ctrl+x")
+            await rebuilt(app, p)
+            await p.pause()
+            assert len(app._visible) == n - 1
+            assert (int(lv.scroll_offset.y), lv.index) == (top, index), \
+                (int(lv.scroll_offset.y), lv.index, top, index)
+    try:
+        asyncio.run(drive())
+    finally:
+        cli.save_hidden(set())
+
+
+def test_digits_type_in_the_search_box_outside_review():
+    rows, total = load()
+
+    async def drive():
+        app = cli.build_app(rows, "", False, total, False, discover())
+        async with app.run_test(size=(150, 30)) as p:
+            await p.pause()
+            app.query_one("#search").focus()
+            await p.press("2", "0", "2", "6")
+            assert app.query_one("#search").value == "2026"
     asyncio.run(drive())
 
 
@@ -889,12 +1193,12 @@ def test_hidden_and_review_views_list_the_right_rows():
             lv = app.query_one("#list")
             assert victim not in app._visible and len(lv.lines) == len(app._visible)
             await p.click("#hiddentab")
-            await app.workers.wait_for_complete()
+            await rebuilt(app, p)
             await p.pause()
             assert app._visible == [victim] and len(lv.lines) == 1
             assert victim["name"][:20] in lv.lines[0] and lv.index == 0
             await p.press("f12")
-            await app.workers.wait_for_complete()
+            await rebuilt(app, p)
             await p.pause()
             assert app.view_review and len(lv.lines) == 3 == len(app._visible)
             assert all(r["name"][:20] in ln for r, ln in zip(app._visible, lv.lines))
