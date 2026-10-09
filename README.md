@@ -161,9 +161,9 @@ Earlier versions only searched the last 4 MB of a file for the cost record, and 
 Every reply in a transcript records its token usage: input, output, cache reads, and 5-minute and 1-hour cache writes. The estimate adds up the usage since the last cost record. It counts each API response once, even though it's written as several records, and it includes the session's **subagent** transcripts, because subagent spend is billed to the parent. The total is then priced like this:
 
 - The price ratios between token types come from Anthropic's published pricing structure: output costs 5× input, cache reads 0.1×, 5-minute cache writes 1.25× and 1-hour cache writes 2×.
-- The **base price per model is measured, not hard-coded.** It's derived from the session's own earlier cost record, or failing that, from the newest cost record on disk that used the same model. There's no price table to go out of date.
+- The **base price per model is measured, not hard-coded.** It's derived from the session's own earlier cost record, or failing that, from the newest cost record among your 200 most recent sessions that used the same model. Those records are read once, when hopback starts: a model first used after that shows no estimate until the next launch. There's no price table to go out of date.
 
-Back-tested on real sessions by estimating each cost record from the one before it, the median error was about **6.5%**, slightly low on average. A few sessions were far off, probably because of spend the transcript doesn't record. Treat `≈` as a good ballpark, not an invoice. If no cost record on disk has ever used a session's model, no estimate is shown.
+Back-tested on real sessions by estimating each cost record from the one before it, the median error was about **6.5%**, slightly low on average. A few sessions were far off, probably because of spend the transcript doesn't record. Treat `≈` as a good ballpark, not an invoice. If none of those 200 sessions has a cost record for a session's model, no estimate is shown.
 
 ### Why does Codex show tokens but no cost?
 

@@ -48,7 +48,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -56,7 +55,7 @@ from pathlib import Path
 from .adapters import AGENT, BY_NAME, LEFTOVER, ROLES, SCHEDULED, claude
 from .fmt import safe_text, size_str, when
 from .paths import this_host
-from .sources import HOSTS, SRCW, discover
+from .sources import HOSTS, SAFE_ID, SRCW, discover
 
 DIRW = 44
 
@@ -498,10 +497,10 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             if value is not None:
                 top, h = int(self.scroll_offset.y), max(1, self.scrollable_content_region.height)
                 if value < top:
-                    self.scroll_to(y=value, animate=False, immediate=True)
+                    self.scroll_to(y=value, animate=False, immediate=True, force=True)
                     self.hover = None      # the pointer is over another row now
                 elif value >= top + h:
-                    self.scroll_to(y=value - h + 1, animate=False, immediate=True)
+                    self.scroll_to(y=value - h + 1, animate=False, immediate=True, force=True)
                     self.hover = None      # (the next mouse move sets it again)
             self.refresh()
             self.post_message(self.Highlighted())
@@ -515,7 +514,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.hover = None
             self._index = None
             self.virtual_size = Size(0, len(lines))
-            self.scroll_to(y=top if keep_scroll else 0, animate=False, immediate=True)
+            self.scroll_to(y=top if keep_scroll else 0, animate=False, immediate=True, force=True)
             self.index = index if lines else None
             self.refresh()
 
@@ -741,6 +740,12 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.report_state()
             if self.review_on:
                 self.action_show_review()
+
+        def warn(self, text, **kw):
+            """The one way to show a notification: the text is shown exactly as
+            given (no markup, no control characters), whatever a path or an
+            error message contains."""
+            self.notify(safe_text(text), markup=False, **kw)
 
         def on_unmount(self):
             claude.STOP.set()      # a rate scan in the thread fallback ends at its next file
@@ -1080,7 +1085,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self._review_loading = False
             self.review_rows = rows
             for p in problems:
-                self.notify(safe_text(p), severity="error", timeout=30)
+                self.warn(p, severity="error", timeout=30)
             if self.view_review:
                 self.run_worker(self.refresh_rows(keep_index=False))
 
@@ -1095,7 +1100,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             # Not while the scan is loading: the list on screen is not yet
             # the review list, so the mark would land on the wrong session.
             if self.review_rows is None:
-                self.notify("still scanning: nothing marked yet")
+                self.warn("still scanning: nothing marked yet")
                 return
             cur = self._current()
             if cur is None:
@@ -1124,7 +1129,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 except OSError as exc:
                     failed = exc
             if failed is not None:
-                self.notify(f"couldn't save the verdict ({failed}); kept here, saved with the next mark",
+                self.warn(f"couldn't save the verdict ({failed}); kept here, saved with the next mark",
                             severity="warning")
             self.report_state()
             apply_review(self.all_rows, self.review)   # shows at once in the main list
@@ -1150,7 +1155,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
         def report_state(self):
             """Show (once) what went wrong reading saved state."""
             while STATE_PROBLEMS:
-                self.notify(safe_text(STATE_PROBLEMS.pop(0)), severity="warning", timeout=30)
+                self.warn(STATE_PROBLEMS.pop(0), severity="warning", timeout=30)
 
         def action_show_hidden(self):
             if self.view_hidden:
@@ -1163,7 +1168,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
 
         def action_toggle_hide(self):
             if self.view_review:
-                self.notify("leave the Review view to hide sessions")
+                self.warn("leave the Review view to hide sessions")
                 return
             cur = self._current()
             if cur is None:
@@ -1176,7 +1181,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             try:
                 fresh = load_hidden()
             except OSError as exc:             # unreadable: never save over it
-                self.notify(f"couldn't read the hidden list ({exc}); nothing changed", severity="error")
+                self.warn(f"couldn't read the hidden list ({exc}); nothing changed", severity="error")
                 return
             # Found damaged and set aside: keep what this picker holds.
             self.hidden = fresh | self.hidden if len(STATE_PROBLEMS) > seen else fresh
@@ -1188,7 +1193,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             try:
                 save_hidden(self.hidden)
             except OSError as exc:
-                self.notify(f"couldn't save the hidden list ({exc}); it lasts until you quit",
+                self.warn(f"couldn't save the hidden list ({exc}); it lasts until you quit",
                             severity="warning")
             self.run_worker(self.refresh_rows())
 
@@ -1208,7 +1213,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             wrong session."""
             lv = self.query_one("#list", SessionList)
             if self._shown_ticket != self._refresh_ticket:
-                self.notify("the list is updating, press again")
+                self.warn("the list is updating, press again")
                 return None
             if not self._visible or lv.index is None:
                 return None
@@ -1268,7 +1273,7 @@ def doctor(sources):
             n = f"{src.adapter.count(src.root):,} sessions"
         except Exception as exc:  # noqa: BLE001
             n = f"UNREADABLE: {exc}"
-        print(f"  {src.tag:<{SRCW}} {str(src.root):<48} {n}")
+        print(safe_text(f"  {src.tag:<{SRCW}} {str(src.root):<48} {n}", line=True))
     mode = "picker" if sys.stdin.isatty() and sys.stdout.isatty() else "list"
     print(f"\nwould use   {mode}")
     if mode == "list":
@@ -1346,7 +1351,7 @@ def main():
         for src in scoped:
             try:
                 hits += [(src, i) for i in src.adapter.ids(src.root)
-                         if i == want or (args.id and i.startswith(want))]
+                         if i == want or (args.id and i.startswith(want) and SAFE_ID.fullmatch(i))]
             except Exception as exc:  # noqa: BLE001 - one bad store mustn't hide the others
                 print(safe_text(f"{src.tag}: could not read {src.root} "
                                 f"({exc.__class__.__name__}: {exc})", line=True), file=sys.stderr)
@@ -1355,7 +1360,7 @@ def main():
         if len(hits) > 1 and args.id:
             print(f"{len(hits)} sessions match {want!r}:", file=sys.stderr)
             for src, i in hits[:10]:
-                print(f"  {src.tag:<{SRCW}} {i}", file=sys.stderr)
+                print(safe_text(f"  {src.tag:<{SRCW}} {i}", line=True), file=sys.stderr)
             sys.exit(1)
         src, sid = hits[0]
         if args.id:
@@ -1367,7 +1372,7 @@ def main():
             print(safe_text(f"warning: {w}", line=True), file=sys.stderr)
         row = next((r for r in rows if r["id"] == sid), None)
         if row is None:
-            sys.exit(f"session {sid} could not be read")
+            sys.exit(f"session {sid!r} could not be read")
         print(preview(row, args.preview_width))
         return
 
@@ -1406,9 +1411,9 @@ def main():
             sys.exit("no matching sessions")
         if args.print_cd:
             # Non-interactive resume: the newest match, printed, not run.
-            # The output is read by a shell (cd "$(hopback --print-cd x)"), so it
-            # is printed exactly as launch() built it: changing a path would cd
-            # somewhere else. launch() refuses control characters instead.
+            # The output is read by a shell, so a path is never altered: launch()
+            # quotes it, and a control or invisible character comes out as a
+            # $'\xNN' escape that bash and zsh read back as the same bytes.
             try:
                 print(rows[0]["source"].launch(rows[0], args.yolo)[2])
             except RuntimeError as exc:
@@ -1447,8 +1452,10 @@ def main():
         bad = foreign_owned(tmp)
         if bad:
             conf = Path("/etc/tmpfiles.d/claude.conf")
-            sys.exit(f"claude will refuse to start: these paths under {tmp} are not owned by you:\n  "
-                     + "\n  ".join(bad[:20])
+            # The paths are file names someone else created: render them, as lines.
+            sys.exit(f"claude will refuse to start: these paths under {safe_text(str(tmp), line=True)} "
+                     "are not owned by you:\n  "
+                     + "\n  ".join(safe_text(b, line=True) for b in bad[:20])
                      + (f"\n  ... and {len(bad) - 20} more" if len(bad) > 20 else "")
                      + "\nUsually a Docker bind mount recreated them as root. Fix: sudo rm -rf "
                        "the listed paths"
