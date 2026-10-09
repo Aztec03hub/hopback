@@ -369,8 +369,8 @@ def last_line_with(path, marker, chunk=4 * 1024 * 1024, errors=None):
                 tail = buf[:cut] if cut >= 0 else buf
                 pos = start
     except OSError as exc:
-        if errors is not None:     # the caller can tell unreadable from absent
-            errors.append(exc)
+        if errors is not None and not isinstance(exc, PermissionError):
+            errors.append(exc)     # transient (EIO ...): the caller retries; a permission problem is permanent
     return None, None
 
 
@@ -490,7 +490,10 @@ def _file_rates(store, max_files):
     rate for that model; a file that vanishes between the glob and the stat is
     not a candidate; a line json cannot parse is no record. None of these stops
     the other models or files. A scan cut short by STOP, or one that found no
-    file at all, is returned but not kept.
+    file at all, or one that hit a transient read error (EIO, a failed listing), is
+    returned but not kept. A file we may not read (PermissionError) is permanent: it
+    counts as no record and the scan is kept, so one root-owned file cannot make every
+    preview rescan 200 files.
     """
     found = _RATES.get(store)       # lock-free: a stored list is never mutated
     if found is not None:

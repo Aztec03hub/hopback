@@ -404,10 +404,8 @@ def test_an_unreadable_or_unlistable_store_is_retried_not_cached():
     try:
         claude._RATES.clear()
         if os.geteuid() != 0:
-            assert claude.model_rates({"opus"}, store) == [] or not claude.model_rates({"opus"}, store)
-            assert store not in claude._RATES
-            f.chmod(0o600)
-            assert "opus" in claude.model_rates({"opus"}, store)
+            assert not claude.model_rates({"opus"}, store)
+            assert store in claude._RATES                  # permanent: kept, so not rescanned each preview
     finally:
         f.chmod(0o600)
     # A glob that fails with EIO: nothing on stderr from the warm thread, nothing cached.
