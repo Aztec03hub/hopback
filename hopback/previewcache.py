@@ -83,14 +83,15 @@ class Previewer:
 
     # -- disk ----------------------------------------------------------------
     def _load(self):
+        # A damaged or foreign cache is ignored, never fatal: it is rebuilt.
         try:
             data = json.loads(self.path.read_text())
-        except (OSError, ValueError):
+            if data.get("version") != _version():
+                return
+            mem = {k: (list(st), dict(d)) for k, (st, d) in data["entries"].items()}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
             return
-        if data.get("version") != _version():
-            return
-        for k, (st, d) in (data.get("entries") or {}).items():
-            self._mem[k] = (st, d)
+        self._mem.update(mem)
 
     def save(self):
         if not self.persist or not self._dirty:

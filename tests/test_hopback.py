@@ -223,6 +223,10 @@ def test_preview_cache_round_trips_and_notices_changes():
     assert warm.get(r) == d                  # a new run starts warm
     r["mtime"] += 1
     assert warm.get(r) is None               # a changed session is read again
+    for junk in ("{not json", "[1, 2]", '{"version": "x"}',
+                 '{"version": "%s", "entries": {"k": 5}}' % previewcache._version()):
+        path.write_text(junk)
+        assert previewcache.Previewer(path=path).get(r) is None   # ignored, not fatal
 
 
 def test_model_rates_scans_a_store_once():
