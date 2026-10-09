@@ -735,6 +735,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                     yield Static("", id="preview_body", markup=False)
 
         async def on_mount(self):
+            claude.STOP.clear()
             await self.refresh_rows()
             self.query_one("#search", Input).focus()
             self.report_state()
@@ -742,6 +743,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
                 self.action_show_review()
 
         def on_unmount(self):
+            claude.STOP.set()      # a rate scan in the thread fallback ends at its next file
             # Kill, not just shut down: ENTER execs the agent straight after
             # this, and a worker mid-preview would outlive hopback inside it.
             if self._pool:

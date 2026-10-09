@@ -362,7 +362,7 @@ def last_line_with(path, marker, chunk=4 * 1024 * 1024):
                     b = len(buf) if b < 0 else b
                     try:
                         return start + b, json.loads(buf[a:b])
-                    except ValueError:
+                    except (ValueError, RecursionError):   # an unparsable line is no record
                         return None, None
                 # Keep a partial first line so a match split across chunks is found.
                 cut = buf.find(b"\n")
@@ -442,7 +442,9 @@ def time_before(path, offset, span=256 * 1024):
 
 
 _RATES = {}  # store -> [(path, {model: rate}), ...], newest file first
-_RATES_LOCK = threading.Lock()
+_RATES_GUARD = threading.Lock()   # guards _RATES_LOCKS only, never held during a scan
+_RATES_LOCKS = {}                 # store -> Lock held while that store is scanned
+STOP = threading.Event()          # set when the app closes: scans stop at the next file
 
 
 def _num(v):
@@ -485,30 +487,44 @@ def _file_rates(store, max_files):
 
     A malformed model entry (null or non-numeric tokens, no dollars) gives no
     rate for that model; a file that vanishes between the glob and the stat is
-    not a candidate. Neither stops the other models or files.
+    not a candidate; a line json cannot parse is no record. None of these stops
+    the other models or files. A scan cut short by STOP, or one that found no
+    file at all, is returned but not kept.
     """
-    with _RATES_LOCK:
-        if store not in _RATES:
-            dated = []
-            for p in store.glob("*/*.jsonl"):
-                try:
-                    dated.append((p.stat().st_mtime, p))
-                except OSError:        # deleted since the glob: not a candidate
-                    continue
-            dated.sort(key=lambda d: d[0], reverse=True)
-            found = []
-            for _, path in dated[:max_files]:
-                _, rec = last_line_with(path, COST_MARK)
-                usage = rec.get("modelUsage") if isinstance(rec, dict) else None
-                rates = {}
-                for model, u in (usage if isinstance(usage, dict) else {}).items():
-                    rate = _entry_rate(u)
-                    if rate is not None:
-                        rates[model] = rate
-                if rates:
-                    found.append((path, rates))
+    found = _RATES.get(store)       # lock-free: a stored list is never mutated
+    if found is not None:
+        return found
+    with _RATES_GUARD:
+        lock = _RATES_LOCKS.setdefault(store, threading.Lock())
+    with lock:                      # only a caller of the SAME store waits
+        if store in _RATES:
+            return _RATES[store]
+        dated = []
+        for p in store.glob("*/*.jsonl"):
+            try:
+                dated.append((p.stat().st_mtime, p))
+            except OSError:        # deleted since the glob: not a candidate
+                continue
+        dated.sort(key=lambda d: d[0], reverse=True)
+        found = []
+        for _, path in dated[:max_files]:
+            if STOP.is_set():      # the app is closing: give up, cache nothing
+                return found
+            _, rec = last_line_with(path, COST_MARK)
+            usage = rec.get("modelUsage") if isinstance(rec, dict) else None
+            rates = {}
+            for model, u in (usage if isinstance(usage, dict) else {}).items():
+                rate = _entry_rate(u)
+                if rate is not None:
+                    rates[model] = rate
+            if rates:
+                found.append((path, rates))
+        # Cache a scan that saw files. A store with none (an unmounted drive, a
+        # glob that came back empty) may be a hiccup, so the next call retries;
+        # an empty store costs one glob to retry.
+        if dated:
             _RATES[store] = found
-        return _RATES[store]
+        return found
 
 
 def warm_rates(store, max_files=200):
