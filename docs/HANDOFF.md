@@ -3,7 +3,7 @@
 Read this first, then `docs/PLAN.md`. Verify state with `git log` before trusting any of it.
 
 ## Where things are
-- Repo: `~/claude_projects/hopback` (folder was `claude-sessions`), GitHub https://github.com/Aztec03hub/hopback (PUBLIC, renamed from claude-sessions; old URLs redirect). Last pushed commit at writing: `1f0ed00`.
+- Repo: `~/claude_projects/hopback` (folder was `claude-sessions`), GitHub https://github.com/Aztec03hub/hopback (PUBLIC, renamed from claude-sessions; old URLs redirect). Last pushed commit at writing: `04e140e` (merge of PR #1, spawn detection and the Hidden/Review views).
 - Installed for Phil via `bash install.sh`: venv `~/.local/share/hopback/venv`, symlinks `~/.local/bin/hopback` and `~/.local/bin/claude-sessions`. Re-run `install.sh` after every code change so his local copy matches, then `cmp` an installed file against the repo: pip can skip a same-version local reinstall.
 - Old install `~/.local/share/claude-sessions/` is unused leftover; not deleted (Phil hasn't asked).
 - Origin: tool was first built in Claude session `0439c59b-773a-43f0-91f6-9faa38930a45` (2026-08-29, plain print -> fzf -> Textual rewrite at 02:48Z on Phil's request).
@@ -41,7 +41,7 @@ Read this first, then `docs/PLAN.md`. Verify state with `git log` before trustin
 - Textual: never cancel a ListView rebuild part way (an `exclusive=True` worker cancelled inside `clear()`/`extend()` froze the picker). Rebuilds queue on a lock, newest ticket wins.
 
 ## Next
-- Phil is going through the Review view (`hopback --review` / F12), the 32 sessions that would leave his list first. Then commit the 2026-10-08 work and push. A rejection pattern there may point at a detector rule to fix.
+- Done 2026-10-08: Phil reviewed all 96 `spawn` marks and accepted every one (no false positives); merged as PR #1.
 - Phase 6 adapters (Qwen Code, Copilot CLI, Goose, ...): blocked on having a real install to inspect; don't build from docs alone.
 - Group-by-directory view (PLAN Option D).
 - Optional: list cache for startup speed; LICENSE (none yet, so legally all-rights-reserved; ask Phil).
