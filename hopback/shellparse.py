@@ -11,22 +11,15 @@ a `$( )` inside an unquoted heredoc, a `[[ ]]` or a case word does, as in bash.
 Text without the literal word `claude` is never parsed, so a name spelled with
 quotes or escapes (`cla"ude"`, `c\\laude`) is missed (the safe direction).
 
-Parsing is tree-sitter-bash: a real grammar, chosen over the earlier
-hand-written lexer and over bashlex by measurement on 162,750 real commands
-(hopback-review/parser-bench/REPORT.md). This module only walks the tree and
-decides.
-
-Anything that isn't valid shell is not a launch: a miss leaves a session
-visible, which is the safe direction. Known grammar limits (measured
-2026-10-08 on real commands): two heredocs opened on one line (`cat <<a; cat
-<<b`) are a syntax error to it, 175 real commands, none holding a launch; a
-function whose body is a bare loop (`f() while ...; done`) hides a launch on
-the line after it, and a heredoc terminator indented with spaces (which bash
-rejects) is accepted, neither seen in real commands.
+Parsing, wrappers and nested shells come from bashtree (vendored in
+hopback/_vendor/bashtree, shared with bash-write-guard; its docstring lists the
+grammar's known limits). This module only decides what counts as a launch.
+Anything bashtree can't parse is not a launch: a miss leaves a session
+visible, which is the safe direction.
 """
 import os
-import re
-import threading
+
+from ._vendor.bashtree import nested, parse, unwrap
 
 # `claude <these>` doesn't begin a new conversation.
 # From `claude --help` (2.1.289), plus older names.
@@ -36,171 +29,18 @@ SUBCOMMANDS = {"mcp", "plugin", "plugins", "config", "update", "upgrade", "docto
                "login", "logout", "rc", "remote-control"}
 NOT_NEW_FLAGS = {"--version", "-v", "--help", "-h", "--resume", "-r", "--continue", "-c",
                  "--from-pr"}
-# Wrappers, and how many value arguments each of their options takes.
-WRAPPERS = {"env": {"-u": 1, "-C": 1, "-S": 1, "-P": 1, "--unset": 1, "--chdir": 1,
-                    "--split-string": 1, "--argv0": 1},
-            "timeout": {"-s": 1, "-k": 1, "--signal": 1, "--kill-after": 1},
-            "sudo": {"-u": 1, "-g": 1, "-C": 1, "-D": 1, "-h": 1, "-p": 1, "-r": 1, "-t": 1,
-                     "-U": 1, "-T": 1,
-                     "--user": 1, "--group": 1, "--chdir": 1, "--host": 1, "--prompt": 1,
-                     "--role": 1, "--type": 1, "--close-from": 1},
-            "nice": {"-n": 1, "--adjustment": 1}, "nohup": {}, "setsid": {},
-            "exec": {"-a": 1}, "command": {}, "stdbuf": {"-i": 1, "-o": 1, "-e": 1},
-            "time": {"-f": 1, "-o": 1}, "ionice": {"-c": 1, "-n": 1, "--class": 1, "--classdata": 1}}
-# A wrapper option (or short-option bundle) that makes it look up or list
-# instead of running: `command -v claude`, `sudo -l claude`.
-WRAPPER_QUERY = {"command": (set("vV"), set()),
-                 "sudo": (set("lvkKe"), {"--list", "--validate", "--edit"})}
-
-
-def _bundle_has(opt, letters, longs=()):
-    """True if `opt` is one of `longs`, or a short-option bundle (`-lv`)
-    containing any of `letters`. Plain string tests: a regex here backtracked
-    quadratically on a long bundle."""
-    if opt in longs:
-        return True
-    return (opt.startswith("-") and not opt.startswith("--") and opt[1:].isalpha()
-            and bool(letters & set(opt[1:])))
-TMUX_RUNS = {"new-window", "neww", "split-window", "splitw", "new-session", "new",
-             "respawn-pane", "respawnp", "respawn-window", "respawnw"}
-TMUX_TAKES_VALUE = set("tncFeslxyp") | {"-t", "-n", "-c", "-F", "-e", "-s", "-l", "-x", "-y", "-p"}
-_ASSIGN = re.compile(r"^[A-Za-z_]\w*(\[[^]]*\])?\+?=")
-# Bigger than any real command (largest seen: well under 1 MB). Parsing is
-# linear, so this bounds the cost, not correctness.
+# Bigger than any real command (largest seen: well under 1 MB).
 MAX_COMMAND = 4 * 1024 * 1024
-# tree-sitter-bash parses N heredocs in one command in O(N^2): 1,000 take
-# 0.07 s, 40,000 take 56 s (measured 2026-10-08). The cap counts every `<<`
-# (here-strings and quoted text too), so it errs towards giving up early; the
-# most `<<` in one real command was 12.
-MAX_HEREDOCS = 256
-# Same for unclosed nested arrays (`a=(a=(a=(...`): 8,000 take 1.5 s, 50,000
-# take 46 s (measured 2026-10-08). The most `=(` in one real command was 19.
-MAX_ARRAYS = 1000
-# Children of a `command` node that are words passed to it (redirects aren't).
-_WORDS = {"word", "string", "raw_string", "ansi_c_string", "concatenation", "number",
-          "simple_expansion", "expansion", "command_substitution", "translated_string",
-          "process_substitution", "arithmetic_expansion"}
-_LOCAL = threading.local()                          # a Parser isn't safe to share across threads
-
-
-def _parser():
-    if not hasattr(_LOCAL, "parser"):
-        import tree_sitter_bash
-        from tree_sitter import Language, Parser
-        _LOCAL.parser = Parser(Language(tree_sitter_bash.language()))
-    return _LOCAL.parser
-
-
-def _unescape(raw, special):
-    """Drop the backslash before any character in `special` ("" = any). A
-    backslash-newline joins lines."""
-    out, i = [], 0
-    while i < len(raw):
-        if raw[i] == "\\" and i + 1 < len(raw) and (not special or raw[i + 1] in special):
-            if raw[i + 1] != "\n":
-                out.append(raw[i + 1])
-            i += 2
-        else:
-            out.append(raw[i])
-            i += 1
-    return "".join(out)
-
-
-# bash's $'...' escapes. \x and octal give BYTES (so \xc3\xa9 is one é),
-# \u and \U give characters; \cX and anything unknown stay as written.
-_ANSI_C = re.compile(r"\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|.)", re.S)
-_ANSI_C_SIMPLE = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v",
-                  "e": "\x1b", "E": "\x1b", "\\": "\\", "'": "'", '"': '"', "?": "?"}
-
-
-def _ansi_c(text):
-    out, pos = bytearray(), 0
-    for m in _ANSI_C.finditer(text):
-        out += text[pos:m.start()].encode("utf-8", "surrogatepass")
-        pos, s = m.end(), m[1]
-        if s[0] == "x" and len(s) > 1:
-            out.append(int(s[1:], 16))
-        elif s[0] in "01234567":
-            out.append(int(s, 8) & 0xFF)
-        elif s[0] in "uU" and len(s) > 1 and int(s[1:], 16) <= 0x10FFFF:
-            out += chr(int(s[1:], 16)).encode("utf-8", "surrogatepass")
-        else:
-            out += _ANSI_C_SIMPLE.get(s, m[0]).encode("utf-8", "surrogatepass")
-    out += text[pos:].encode("utf-8", "surrogatepass")
-    return out.decode("utf-8", "replace")
-
-
-def _text(node, src):
-    """A word as the shell passes it on: quotes removed, escapes resolved.
-    Expansions stay as written; nothing is evaluated."""
-    raw = src[node.start_byte:node.end_byte].decode("utf-8", "replace")
-    t = node.type
-    if t == "raw_string":
-        return raw[1:-1]
-    if t == "ansi_c_string":
-        return _ansi_c(raw[2:-1])
-    if t == "word":
-        return _unescape(raw, "")
-    if t == "string":                                # in "...", \ escapes only these
-        # The whole text, not its children: a newline between two lines of
-        # the string is a gap between child nodes, and joining them lost it.
-        return _unescape(raw[1:-1], '$`"\\\n')
-    if t == "concatenation":
-        return "".join(_text(c, src) for c in node.children)
-    return raw
+# Nested shells hopback follows. eval is left out: it was never counted, and
+# a miss is the safe direction.
+_FOLLOWS = {"bash", "sh", "zsh", "dash", "script", "screen", "tmux", "tmux send-keys"}
 
 
 def _split(command):
-    """Simple commands, as word lists, that would actually run.
-
-    [] when the text isn't valid shell. bash's eval does run the complete
-    commands before a syntax error, so a launch there is missed; measured on
-    2026-10-08, none of 485 real commands with a syntax error held one, while
-    walking broken trees added 11 false positives to the test table.
-    Also [] past MAX_HEREDOCS `<<`, which no real command comes near."""
-    if command.count("<<") > MAX_HEREDOCS or command.count("=(") > MAX_ARRAYS:
-        return []
-    src = command.encode("utf-8", "surrogatepass")
-    tree = _parser().parse(src)
-    if tree.root_node.has_error:
-        return []
-    out, stack = [], [tree.root_node]                # iterative: depth costs no stack frames
-    while stack:
-        n = stack.pop()
-        if n.type == "function_definition":          # defined, not run
-            continue
-        if n.type == "command":
-            words = []
-            for c in n.children:
-                if c.type == "variable_assignment":
-                    words.append(src[c.start_byte:c.end_byte].decode("utf-8", "replace"))
-                elif c.type == "command_name":
-                    words.append(_text(c.children[0], src))
-                elif c.type in _WORDS:
-                    words.append(_text(c, src))
-            if words:
-                out.append(words)
-        stack.extend(reversed(n.children))
-    return out
-
-
-def _skip_options(args, takes_value):
-    """args after a command's own options. `takes_value` maps an option such
-    as "-S" (or just "S") to how many values follow it; in a bundle of short
-    options (`-dmS name`) the last letter decides."""
-    counts = takes_value if isinstance(takes_value, dict) else {k: 1 for k in takes_value}
-    letters = {k.lstrip("-")[-1:]: n for k, n in counts.items() if len(k.lstrip("-")) == 1}
-    i = 0
-    while i < len(args) and args[i].startswith("-") and args[i] != "-":
-        flag = args[i]
-        i += 1
-        if flag == "--":
-            break
-        if flag in counts:
-            i += counts[flag]
-        elif not flag.startswith("--") and flag[-1:] in letters:
-            i += letters[flag[-1:]]
-    return args[i:]
+    """Word lists of the simple commands that would run (a function body that
+    is only defined doesn't). [] if unparseable: bashtree then has none."""
+    return [[w.text for w in c.words] for c in parse(command).commands
+            if c.kind == "simple" and not c.inside("function_body")]
 
 
 def _runs_claude(tokens, depth, launch=None):
@@ -210,70 +50,22 @@ def _runs_claude(tokens, depth, launch=None):
     launch = launch or is_launch
     if depth > 4:
         return False
-    i = 0
-    while i < len(tokens) and _ASSIGN.match(tokens[i]):
-        i += 1                         # VAR=value prefixes
-    tokens = tokens[i:]
-    wrapped = 0
-    while tokens and os.path.basename(tokens[0]) in WRAPPERS:
-        wrapped += 1
-        if wrapped > 8:
-            return False               # no real command nests this deep
-        name = os.path.basename(tokens[0])
-        table = WRAPPERS[name]
-        rest = _skip_options(tokens[1:], table)
-        opts = tokens[1:len(tokens) - len(rest)]
-        query = WRAPPER_QUERY.get(name)
-        if query and any(_bundle_has(o, *query) for o in opts):
-            return False
-        if any(o.startswith("--") and "=" not in o and o != "--" and o not in table for o in opts):
-            return False               # an option we can't size: don't guess the program
-        j = 0
-        while j < len(rest) and _ASSIGN.match(rest[j]):
-            j += 1                     # env A=1 B=2 claude
-        if name == "timeout" and j < len(rest):
-            j += 1                     # the duration
-        tokens = rest[j:]
-    if not tokens:
-        return False
-    prog, args = os.path.basename(tokens[0]), tokens[1:]
+    u = unwrap(tokens)
+    if u.stopped or not u.words:
+        return False                   # a lookup, or a wrapper we can't see past
+    prog, args = os.path.basename(u.words[0]), u.words[1:]
     if prog == "claude":
         positional = [a for a in args if not a.startswith("-")]
         if set(positional[:2]) & SUBCOMMANDS:
             return False               # `claude mcp ...`, `claude --model m mcp ...`
         return not any(a in NOT_NEW_FLAGS or a.startswith(("--resume=", "--from-pr=")) for a in args)
-    if prog in ("bash", "sh", "zsh", "dash", "script"):
-        # `-c` (or a bundle such as `-lc`) among the options before the first
-        # operand; `bash script.sh -c x` passes -c to the script instead.
-        for k, a in enumerate(args):
-            if not a.startswith("-") or a == "--":
-                return False
-            if not a.startswith("--") and "c" in a[1:]:
-                return k + 1 < len(args) and launch(args[k + 1], depth + 1)
-        return False
-    if prog == "screen":
-        opts = args[:len(args) - len(_skip_options(args, {"-S": 1, "-t": 1, "-c": 1}))]
-        if any(_bundle_has(o, set("rRxXQ"), {"-ls", "-list", "-wipe"}) for o in opts):
-            return False               # reattaching or querying, not starting
-        return _runs_claude(args[len(opts):], depth + 1, launch)
-    if prog == "tmux":
-        rest = _skip_options(args, {"-L": 1, "-S": 1, "-f": 1})
-        if not rest:
-            return False
-        sub, rest = rest[0], rest[1:]
-        if sub in TMUX_RUNS:
-            rest = _skip_options(rest, TMUX_TAKES_VALUE)
-            if len(rest) == 1:
-                return launch(rest[0], depth + 1)
-            return _runs_claude(rest, depth + 1, launch)
-        if sub in ("send-keys", "send"):
-            # Typed keys run only when Enter follows them in the same call.
-            rest = _skip_options(rest, {"-t", "-N"})
-            enter = [j for j, key in enumerate(rest) if key in ("Enter", "C-m", "KPEnter")]
-            if not enter:
-                return False
-            typed = " ".join(key for key in rest[:enter[-1]] if key not in ("Enter", "C-m", "KPEnter"))
-            return launch(typed, depth + 1)
+    for n in nested(u.words):
+        if n.via not in _FOLLOWS:
+            continue
+        if n.kind == "text" and launch(n.text, depth + 1):
+            return True
+        if n.kind == "words" and _runs_claude(list(n.words), depth + 1, launch):
+            return True
     return False
 
 

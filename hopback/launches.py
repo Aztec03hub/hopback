@@ -66,12 +66,15 @@ _SPACE = re.compile(r"\s+")
 
 @functools.cache
 def version():
-    """The cache is only valid for this exact detection logic, grammar
-    included: a new tree-sitter-bash can parse a command differently.
-    Computed on first use, not at import: a missing package must surface
-    where detection runs (and is shown), not stop every harness loading."""
-    return hashlib.sha1(Path(__file__).read_bytes()
-                        + (Path(__file__).parent / "shellparse.py").read_bytes()
+    """The cache is only valid for this exact detection logic: this module,
+    shellparse.py, the vendored bashtree, and the grammar (a new
+    tree-sitter-bash can parse a command differently). Computed on first use,
+    not at import: a missing package must surface where detection runs (and
+    is shown), not stop every harness loading."""
+    here = Path(__file__).parent
+    sources = [Path(__file__), here / "shellparse.py",
+               *sorted((here / "_vendor" / "bashtree").glob("*.py"))]
+    return hashlib.sha1(b"".join(p.read_bytes() for p in sources)
                         + "|".join(metadata.version(p) for p in ("tree-sitter", "tree-sitter-bash")).encode()
                         ).hexdigest()[:12]
 

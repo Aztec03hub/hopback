@@ -4,7 +4,9 @@ version = "0.2.0"
 description = "Browse and resume AI coding-agent sessions from any directory"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["textual>=8.2", "tree-sitter>=0.23", "tree-sitter-bash>=0.23"]
+# tree-sitter pins match the vendored bashtree's: a new grammar can parse a
+# command differently.
+dependencies = ["textual>=8.2", "tree-sitter==0.26.0", "tree-sitter-bash==0.25.1"]
 
 [project.scripts]
 hopback = "hopback.cli:run"
@@ -15,4 +17,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["hopback", "hopback.adapters"]
+packages = ["hopback", "hopback.adapters", "hopback._vendor", "hopback._vendor.bashtree"]
+
+[tool.setuptools.package-data]
+"hopback._vendor.bashtree" = ["VENDORED"]
