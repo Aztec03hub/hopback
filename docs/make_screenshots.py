@@ -23,11 +23,9 @@ sys.path.insert(0, str(HERE.parent / "tests"))
 # Same length as "/home/dev" so the substitution below keeps SVG text widths.
 FAKE_HOME = Path("/tmp/csdm")
 FAKE_WIN = Path("/tmp/cswn")
-for d in (FAKE_HOME, FAKE_WIN):
-    shutil.rmtree(d, ignore_errors=True)
-    d.mkdir()
 os.environ["HOME"] = str(FAKE_HOME)
 os.environ["HOPBACK_WINDOWS_HOME"] = str(FAKE_WIN)
+os.environ["XDG_STATE_HOME"] = str(FAKE_HOME / ".state")  # not the real hidden list
 
 import demo_store  # noqa: E402
 from hopback import cli  # noqa: E402
@@ -69,6 +67,7 @@ async def shoot(name, keys=(), query="", hover=None, pick=None):
             await pilot.pause()
         if pick:
             select(app, pick)
+        await app.workers.wait_for_complete()
         if hover:
             await pilot.hover("#list", offset=hover)
         await pilot.pause(0.3)
@@ -83,6 +82,8 @@ def shoot_list(name):
     from rich.text import Text
     res = subprocess.run([sys.executable, "-m", "hopback", "-l", "-t", "-r", "-s"],
                          cwd=str(HERE.parent), capture_output=True, text=True, env=os.environ)
+    if res.returncode or "Traceback" in res.stderr:
+        sys.exit(f"hopback -l failed, not saving a screenshot of it:\n{res.stderr}")
     con = Console(record=True, width=176, file=open(os.devnull, "w"))
     con.print(Text("$ hopback -l -t -r", style="bold #7aa2f7"))
     con.print(Text(res.stdout.rstrip()))
@@ -93,6 +94,11 @@ def shoot_list(name):
 
 
 async def main():
+    # Here, not at import: the picker's preview workers re-import this module,
+    # and wiping the store from inside one of them empties it mid-run.
+    for d in (FAKE_HOME, FAKE_WIN):
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir()
     ids = demo_store.build(FAKE_HOME, FAKE_WIN)
     # Everything, every harness and host; a Claude session with cost selected,
     # the mouse hovering a Codex row.
@@ -106,6 +112,8 @@ async def main():
     # CTRL-T and CTRL-R: agent sessions and scheduled runs revealed.
     await shoot("agents", keys=("ctrl+t", "ctrl+r"),
                 pick=lambda r: r["id"] == ids["claude-team"])
+    # CTRL-X hid two sessions; the hidden view lists them with their harness.
+    await shoot("hidden", keys=("ctrl+x", "down", "ctrl+x", "ctrl+g"))
     # Search ANDs words and matches the source too.
     await shoot("search", keys=("ctrl+t",), query="acme-api",
                 pick=lambda r: r["id"] == ids["hermes-d-subagent"])

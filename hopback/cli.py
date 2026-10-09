@@ -25,8 +25,11 @@ Usage:
     hopback -l                    plain list, no picker (also auto when piped)
     hopback -n 50 / -a            how many to load per store (default 300) / all
     hopback -d                    only sessions from the current directory
-    hopback -t / -r               include agent sessions / scheduled runs
+    hopback -t / -r / -b          include agent sessions / scheduled runs /
+                                  background-job leftovers
     hopback -s / -e / --archived  include /tmp, empty, archived sessions
+    hopback --hidden              only the sessions you hid
+    hopback --review              open on the Review tab (spawn-detection verdicts)
     hopback --id <prefix>         print the full id for a prefix, then exit
     hopback --print-cd            print the command instead of running it
     hopback --doctor              show every store found and how it resumes
@@ -36,9 +39,13 @@ In the picker:
     ENTER      resume                 CTRL-Y   resume skipping permissions
     TAB        next harness tab       CTRL-O   cycle hosts
     CTRL-T     agent sessions         CTRL-R   scheduled runs
+    CTRL-B     background leftovers   CTRL-X   hide / unhide this session
+    CTRL-G     Hidden view            F12      Review view (1 2 3 0 to mark)
     CTRL-/     preview pane           CTRL-U   clear search      ESC quit
 """
 import argparse
+import asyncio
+import json
 import os
 import sys
 import time
@@ -61,7 +68,10 @@ def load_rows(sources, limit, here_only, deep, **opts):
     rows, total, warnings = [], 0, []
     for src in sources:
         try:
-            got, n = src.adapter.collect(src.root, limit, here_only, deep, **opts)
+            # An adapter may add a third item: problems that didn't cost the
+            # list (spawn detection failing, say). They are shown, not dropped.
+            got, n, *problems = src.adapter.collect(src.root, limit, here_only, deep, **opts)
+            warnings += [f"{src.tag}: {p}" for p in (problems[0] if problems else [])]
         except Exception as exc:  # noqa: BLE001 - any adapter failure is isolated
             warnings.append(f"{src.tag}: could not read {src.root} ({exc.__class__.__name__}: {exc})")
             continue
@@ -108,6 +118,27 @@ def preview(row, width=80):
     except RuntimeError as exc:
         out.append(f"  {'resume':<16} unavailable: {exc}")
     out.append(f"  {'id':<16} {row['id']}\n")
+    if row.get("review"):
+        from . import launches
+        out.append("▸ why it was marked as spawned\n")
+        verdict = row.get("review_verdict")
+        if verdict == "rejected":
+            out.append("  you rejected this: it shows as yours, not as spawned")
+        elif row.get("review_changes"):
+            out.append("  would move out of your list (shown as yours today)"
+                       + ("; you accepted it" if verdict == "accepted" else ""))
+        elif row.get("role") == "lead":
+            out.append("  shown today as an agent-team lead; the spawn mark doesn't change that")
+        else:
+            out.append("  already hidden today for another reason (an agent run, a background"
+                       " job or a /tmp directory)")
+        for label, value in launches.explain(src.root, row["id"]):
+            if label == "launched from" and hasattr(src.adapter, "session_title"):
+                value = f"{src.adapter.session_title(src.root, value.split()[0])}  ({value})"
+            first, *more = str(value).split("\n")
+            out.append(f"  {label:<16} {first}")
+            out += [f"  {'':<16} {m}" for m in more[:12]]
+        out.append("\n  1 accept (it was spawned)   2 reject (I started it)   3 needs discussion   0 clear\n")
     opening = d.get("opening")
     same = bool(opening and d.get("prompt")
                 and str(opening).strip() == str(d["prompt"]).strip())
@@ -141,8 +172,11 @@ def show_path(row, home):
 
 def fmt(row, namew, home, now):
     shown = row["name"]
-    if len(shown) > namew:
-        shown = shown[: namew - 1] + "…"
+    prefix = f"[{row['review_mark']}] " if "review_mark" in row else ""
+    room = max(namew - len(prefix), 2)             # the mark lives inside the NAME column
+    if len(shown) > room:
+        shown = shown[: room - 1] + "…"
+    shown = prefix + shown
     mark = "·" if row["named"] else " "
     size = row.get("size_text") or size_str(row["bytes"])
     return (f'{when(row["mtime"], now):>20}  {row["source"].tag:<{SRCW}} {row["role"]:<4} '
@@ -204,12 +238,175 @@ def keep(row, show_agents, show_scheduled, show_leftovers=False):
     return not (role in SCHEDULED and not show_scheduled)
 
 
+def hidden_path():
+    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(state) / "hopback" / "hidden.json"
+
+
+def hide_key(row):
+    """Session ids are only unique within a harness, so the key names both."""
+    return f'{row["source"].adapter.NAME}:{row["id"]}'
+
+
+# What went wrong reading saved state, for the picker (or the plain list) to show.
+STATE_PROBLEMS = []
+
+
+def _read_state(path, kind):
+    """The JSON in `path` if it holds a `kind`, else None. Missing: None. A
+    damaged file is moved aside (kept, never overwritten) and reported in
+    STATE_PROBLEMS. Unreadable for any other reason: OSError propagates, so
+    nothing saves over a file that couldn't be read."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    try:
+        data = json.loads(raw)             # bytes: bad UTF-8 is a ValueError too
+    except (ValueError, RecursionError):
+        data = None
+    if isinstance(data, kind):
+        return data
+    # Move it aside FIRST, then check that what moved is what was judged: a
+    # second hopback may have replaced it with a good file in between.
+    # Unique to the nanosecond: a second damaged copy never replaces the first.
+    stamp = f"{time.strftime('%Y%m%d-%H%M%S')}.{time.time_ns() % 10**9:09d}"
+    aside = path.with_name(f"{path.name}.damaged-{stamp}-{os.getpid()}")
+    try:
+        os.replace(path, aside)
+    except FileNotFoundError:
+        return None                        # another hopback moved it, and reports it
+    if aside.read_bytes() != raw:          # a good save landed first: put it back
+        try:
+            os.link(aside, path)
+        except FileExistsError:
+            pass                           # and a newer one since: that one stands
+        aside.unlink()
+        return _read_state(path, kind)
+    STATE_PROBLEMS.append(f"{path} was damaged; kept as {aside.name}, starting from empty")
+    return None
+
+
+def load_hidden():
+    data = _read_state(hidden_path(), list) or []
+    return {k for k in data if isinstance(k, str)}
+
+
+REVIEW_MARKS = {"accepted": "✓", "rejected": "✗", "discuss": "?", None: " "}
+
+
+def review_path():
+    return hidden_path().with_name("review.json")
+
+
+def load_review():
+    """{session id: "accepted" | "rejected" | "discuss"}: Phil's verdicts on
+    sessions the spawn detector marked. Entries that aren't one of those are
+    skipped; a damaged file is handled by _read_state."""
+    data = _read_state(review_path(), dict) or {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str) and v in REVIEW_MARKS}
+
+
+def save_review(marks):
+    _write_state(review_path(), marks)
+
+
+def apply_review(rows, marks):
+    """A session Phil rejected as "not spawned" goes back to looking like his;
+    any other verdict, or none, leaves the detector's `spawn` in place. Safe to
+    call again after a mark changes."""
+    for r in rows:
+        if "spawn_team" not in r and r.get("role") == "spawn":
+            r["spawn_team"] = r["team"]            # remember what the detector said
+        if "spawn_team" in r:
+            rejected = marks.get(r["id"]) == "rejected"
+            r["role"], r["team"] = ("", "") if rejected else ("spawn", r["spawn_team"])
+    return rows
+
+
+def review_rows(sources):
+    """(rows, problems): every session the spawn detector marked, from every
+    Claude Code store, whatever its age, the ones that change what the list
+    shows first; and what went wrong, for the Review view to show."""
+    from . import launches
+    out, problems = [], []
+    for src in sources:
+        if src.adapter.NAME != "claude":
+            continue
+        try:
+            # Its problems come back through load_rows below, which runs the
+            # same scan inside collect(); collecting them here too would
+            # show each twice.
+            flagged = launches.started_by(src.root, [])
+        except Exception as exc:  # noqa: BLE001 - shown in the Review view
+            problems.append(f"{src.tag}: spawn detection failed ({exc.__class__.__name__}: {exc})")
+            continue
+        rows, _, warns = load_rows([src], None, False, False, include_teams=True,
+                                   include_scratch=True, include_empty=True, only=set(flagged))
+        problems += warns
+        for r in rows:
+            r["review"] = True
+            # Shown as yours today: its only reason to be hidden is this rule.
+            r["review_changes"] = (r["role"] == "spawn" and not (
+                r["cwd"] == "/tmp" or str(r["cwd"]).startswith("/tmp/")))
+            out.append(r)
+    out.sort(key=lambda r: (not r["review_changes"], -r["mtime"]))
+    return out, problems
+
+
+def _write_state(path, data):
+    """Written to a temp file and renamed, so a crash mid-write can't empty
+    it; a failed write leaves no temp file behind and raises."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def save_hidden(keys):
+    _write_state(hidden_path(), sorted(keys))
+
+
 # --------------------------------------------------------------------------
 # Textual UI
 # --------------------------------------------------------------------------
 
+def _exit_with_parent(parent):
+    """A worker whose picker was killed (SIGTERM, a closed terminal) would wait
+    on its queue forever; poll for the parent and exit when it is gone."""
+    import threading
+
+    def watch():
+        while os.getppid() == parent:
+            time.sleep(1)
+        os._exit(0)
+    threading.Thread(target=watch, daemon=True).start()
+
+
+def preview_pool():
+    """Worker processes for the preview pane, started before Textual takes over
+    stdio (spawning afterwards fails on its replaced file descriptors). spawn,
+    not fork: forking a process that runs threads can deadlock the child."""
+    import concurrent.futures
+    import multiprocessing
+    try:
+        pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=2, mp_context=multiprocessing.get_context("spawn"),
+            initializer=_exit_with_parent, initargs=(os.getpid(),))
+        for _ in range(2):
+            pool.submit(int)   # start both workers now, while startup is under way
+    except (OSError, ImportError, NotImplementedError, ValueError):
+        return None            # previews then run in a thread instead
+    return pool
+
+
 def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=None,
-              show_agents=False, show_scheduled=False, show_leftovers=False, warnings=()):
+              show_agents=False, show_scheduled=False, show_leftovers=False, warnings=(),
+              start_hidden=False, start_review=False):
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -247,6 +444,21 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             if alt:
                 self.add_class("alt")
 
+    class SearchBox(Input):
+        """In the review view, with the search box empty, the digits 0-3 mark
+        the selected session instead of being typed. Once you start a search
+        they type as usual (the clickable controls still mark)."""
+
+        async def _on_key(self, event):
+            if (self.app.view_review and not self.value
+                    and event.character in ("0", "1", "2", "3")):
+                event.stop()
+                event.prevent_default()
+                self.app.action_mark({"1": "accepted", "2": "rejected", "3": "discuss"}
+                                     .get(event.character))
+                return
+            await super()._on_key(event)
+
     class Clickable(Static):
         """A one-line control that runs an app action when clicked."""
 
@@ -269,14 +481,21 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
         }
         #search { border: none; background: #1a1b26; color: #c0caf5; height: 1; }
         #search:focus { border: none; }
-        #tabs { height: 2; background: #16161e; }
+        #tabrow { height: 2; }
+        #tabs { height: 2; width: 1fr; background: #16161e; }
+        #hiddentab { width: auto; height: 1; color: #565f89; padding: 0 2; }
+        #hiddentab:hover { color: #c0caf5; }
+        #hiddentab.active { color: #ffc896; text-style: bold underline; }
+        #reviewtab { width: auto; height: 1; color: #bb9af7; padding: 0 2; }
+        #reviewtab:hover { color: #c0caf5; }
+        #reviewtab.active { color: #ffc896; text-style: bold underline; }
         #tabs Tab { color: #565f89; padding: 0 2; }
         #tabs Tab.-active { color: #ffc896; text-style: bold; }
         #head { color: #7dcfff; height: auto; }
         #warn { color: #f7768e; height: auto; }
         .control { color: #e0af68; height: 1; width: auto; margin-right: 4; }
         .control:hover { background: #2f3549; color: #ffc896; }
-        #controls { height: 1; padding-left: 2; }
+        .controls { height: 1; padding-left: 2; }
         #keys { height: auto; }
         #labels { color: #7dcfff; height: 1; }
         #list { background: #16161e; height: 1fr; scrollbar-size-vertical: 1; }
@@ -313,6 +532,9 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             Binding("ctrl+t", "toggle_agents", "agents", show=False, priority=True),
             Binding("ctrl+r", "toggle_scheduled", "scheduled", show=False, priority=True),
             Binding("ctrl+b", "toggle_leftovers", "background-job leftovers", show=False, priority=True),
+            Binding("ctrl+x", "toggle_hide", "hide or unhide this session", show=False, priority=True),
+            Binding("ctrl+g", "show_hidden", "hidden sessions", show=False, priority=True),
+            Binding("f12", "toggle_review", "review spawn detection", show=False, priority=True),
             Binding("ctrl+o", "cycle_host", "hosts", show=False, priority=True),
             Binding("tab", "cycle_tab(1)", "next tab", show=False, priority=True),
             Binding("shift+tab", "cycle_tab(-1)", "previous tab", show=False, priority=True),
@@ -345,19 +567,53 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.host_text = ""
             self.head_text = ""
             self._hover_idx = None
+            self._previews = {}
+            self._preview_key = None
+            self._preview_timer = None
+            self._pool = preview_pool()
+            self.hidden = load_hidden()
+            self.view_hidden = start_hidden
+            self.review = load_review()
+            self._unsaved = {}             # marks a failed save hasn't written yet
+            self._namew = 4
+            self._refresh_lock = asyncio.Lock()
+            self._refresh_ticket = 0       # the newest rebuild requested
+            self._shown_ticket = 0         # the one the rows on screen came from
+            apply_review(rows, self.review)
+            self.review_rows = None        # loaded the first time the view opens
+            self.review_on = start_review  # the Review tab is shown
+            self.view_review = False
+            self._review_loading = False
 
         def compose(self) -> ComposeResult:
             with Vertical(id="frame") as frame:
                 frame.border_title = "  hopback  "
-                yield Input(placeholder="search", id="search", value=self.search_text)
-                yield Tabs(Tab("All", id="t-all"),
-                           *(Tab(BY_NAME[h].LABEL, id=f"t-{h}") for h in harnesses),
-                           id="tabs", active=f"t-{self.harness or 'all'}")
+                yield SearchBox(placeholder="search", id="search", value=self.search_text)
+                with Horizontal(id="tabrow"):
+                    yield Tabs(Tab("All", id="t-all"),
+                               *(Tab(BY_NAME[h].LABEL, id=f"t-{h}") for h in harnesses),
+                               id="tabs",
+                               active="" if self.view_hidden or start_review
+                               else f"t-{self.harness or 'all'}")
+                    # Outside the Tabs widget on purpose: TAB cycles harnesses
+                    # only, and this view is reached by click or CTRL-G.
+                    yield Clickable("show_hidden", id="hiddentab")
+                    yield Clickable("show_review", id="reviewtab",
+                                    classes="" if start_review else "hidden")
                 yield Static("", id="head", markup=False)
                 yield Static("\n".join(warnings), id="warn", markup=False,
                              classes="" if warnings else "hidden")
-                with Horizontal(id="controls"):
+                with Horizontal(id="controls", classes="controls"):
                     yield Clickable("cycle_host", id="hosts", classes="control")
+                    yield Clickable("toggle_hide", id="hide", classes="control")
+                # One row per kind of thing kept out of the list, so every
+                # toggle is visible, and clickable, even when it hides nothing.
+                with Horizontal(id="reviewbar", classes="controls hidden"):
+                    yield Clickable("mark('accepted')", id="m-acc", classes="control")
+                    yield Clickable("mark('rejected')", id="m-rej", classes="control")
+                    yield Clickable("mark('discuss')", id="m-dis", classes="control")
+                    yield Clickable("mark(None)", id="m-clr", classes="control")
+                with Horizontal(id="toggles", classes="controls"):
                     yield Clickable("toggle_agents", id="toggle", classes="control")
                     yield Clickable("toggle_scheduled", id="sched", classes="control")
                     yield Clickable("toggle_leftovers", id="left", classes="control")
@@ -370,57 +626,137 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
         async def on_mount(self):
             await self.refresh_rows()
             self.query_one("#search", Input).focus()
+            self.report_state()
+            if self.review_on:
+                self.action_show_review()
+
+        def on_unmount(self):
+            # Kill, not just shut down: ENTER execs the agent straight after
+            # this, and a worker mid-preview would outlive hopback inside it.
+            if self._pool:
+                for proc in list(getattr(self._pool, "_processes", {}).values()):
+                    proc.kill()
+                self._pool.shutdown(wait=False, cancel_futures=True)
 
         # -- data ------------------------------------------------------------
         def in_scope(self, r, ignore_harness=False):
-            """Host, harness and toggles, but not the search text."""
+            """Host, harness and toggles, but not the search text. The hidden
+            view shows every session you hid, from any harness, and nothing else."""
             src = r["source"]
             if self.host and src.host != self.host:
                 return False
+            if (hide_key(r) in self.hidden) != self.view_hidden:
+                return False
+            if self.view_hidden:
+                return True
             if not ignore_harness and self.harness and src.adapter.NAME != self.harness:
                 return False
             return keep(r, self.show_agents, self.show_scheduled, self.show_leftovers)
 
         def visible_rows(self):
+            if self.view_review:
+                rs = [dict(r, review_mark=REVIEW_MARKS[self.review.get(r["id"])],
+                           review_verdict=self.review.get(r["id"]))
+                      for r in self.review_rows or []]
+                return rank(rs, self.search_text) if self.search_text else rs
             rs = [r for r in self.all_rows if self.in_scope(r)]
             if self.search_text:
                 rs = rank(rs, self.search_text)
             return rs
 
-        async def refresh_rows(self, keep_index=True):
-            lv = self.query_one("#list", ListView)
-            prev = lv.index if keep_index else 0
-            self._visible = self.visible_rows()
-            home = str(Path.home())
-            now = time.time()
-            namew = min(max((len(r["name"]) for r in self._visible), default=4), 34)
-            self._hover_idx = None
-            await lv.clear()
-            items = [Row(r, fmt(r, namew, home, now), i % 2 == 1)
-                     for i, r in enumerate(self._visible)]
-            if items:
-                await lv.extend(items)
-                lv.index = min(prev or 0, len(items) - 1)
-            self.update_header(namew)
-            self.update_preview()
+        def refresh_rows(self, keep_index=True):
+            """A coroutine that rebuilds the list from the current state. The
+            ticket is taken NOW, at request time, so _current() knows the
+            rows on screen are stale before the rebuild has even started."""
+            self._refresh_ticket += 1
+            return self._rebuild(self._refresh_ticket, keep_index)
+
+        async def _rebuild(self, ticket, keep_index):
+            """Never cancelled part way: cancelling it inside ListView.clear()
+            or extend() left the list never settling and froze the picker
+            (measured 2026-10-08 with the Review scan returning at once). So
+            rebuilds queue on a lock, and one a newer request has overtaken
+            returns at once: each reads the current state, so only the newest
+            needs to run."""
+            async with self._refresh_lock:
+                if ticket != self._refresh_ticket:
+                    return
+                lv = self.query_one("#list", ListView)
+                self._visible = self.visible_rows()
+                if keep_index:
+                    prev = lv.index
+                elif self.view_review:             # start where the work is: the first unmarked
+                    prev = next((i for i, r in enumerate(self._visible) if not r["review_verdict"]), 0)
+                else:
+                    prev = 0
+                home = str(Path.home())
+                now = time.time()
+                namew = min(max((len(r["name"]) for r in self._visible), default=4), 34)
+                if self.view_review:
+                    namew += 4                     # room for the "[x] " mark fmt() puts in the column
+                self._namew = namew
+                self._hover_idx = None
+                await lv.clear()
+                items = [Row(r, fmt(r, namew, home, now), i % 2 == 1)
+                         for i, r in enumerate(self._visible)]
+                if items:
+                    await lv.extend(items)
+                    lv.index = min(prev or 0, len(items) - 1)
+                self._shown_ticket = ticket
+                self.update_header(namew)
+                self.update_preview()
 
         def update_header(self, namew):
             shown = len(self._visible)
-            scoped = [r for r in self.all_rows if self.in_scope(r, ignore_harness=True)]
+            def scoped(hidden_view):
+                was, self.view_hidden = self.view_hidden, hidden_view
+                try:
+                    return [r for r in self.all_rows if self.in_scope(r, ignore_harness=True)]
+                finally:
+                    self.view_hidden = was
+            shown_rows, hid_rows = scoped(False), scoped(True)
+
+            def label(name, h):
+                n = sum(1 for r in shown_rows if not h or r["source"].adapter.NAME == h)
+                k = sum(1 for r in hid_rows if not h or r["source"].adapter.NAME == h)
+                return f"{name} {n:,}" + (f" (+{k:,} hidden)" if k else "")
             tabs = self.query_one("#tabs", Tabs)
-            tabs.query_one("#t-all", Tab).label = f"All {len(scoped):,}"
+            tabs.query_one("#t-all", Tab).label = label("All", None)
             for h in harnesses:
-                n = sum(1 for r in scoped if r["source"].adapter.NAME == h)
-                tabs.query_one(f"#t-{h}", Tab).label = f"{BY_NAME[h].LABEL} {n:,}"
+                tabs.query_one(f"#t-{h}", Tab).label = label(BY_NAME[h].LABEL, h)
+            ht = self.query_one("#hiddentab", Static)
+            ht.update(f"Hidden {len(hid_rows):,}")
+            ht.set_class(self.view_hidden, "active")
+            rt = self.query_one("#reviewtab", Static)
+            rt.set_class(not self.review_on, "hidden")
+            rt.set_class(self.view_review, "active")
+            if self.review_rows is not None:
+                done = sum(1 for r in self.review_rows if r["id"] in self.review)
+                rt.update(f"Review {done:,}/{len(self.review_rows):,}")
+            else:
+                rt.update("Review")
+            self.query_one("#reviewbar").set_class(not self.view_review, "hidden")
+            if self.view_review and self.review_rows is not None:
+                rs = self.review_rows
+                count = {v: sum(1 for r in rs if self.review.get(r["id"]) == v)
+                         for v in ("accepted", "rejected", "discuss")}
+                changes = sum(1 for r in rs if r["review_changes"])
+                self.query_one("#m-acc", Static).update(f"[ 1 ] accept, it was spawned ({count['accepted']})")
+                self.query_one("#m-rej", Static).update(f"[ 2 ] reject, I started it ({count['rejected']})")
+                self.query_one("#m-dis", Static).update(f"[ 3 ] needs discussion ({count['discuss']})")
+                self.query_one("#m-clr", Static).update(
+                    f"[ 0 ] clear    {len(rs) - sum(count.values())} open · "
+                    f"first {changes} change your list")
             scope = ("this directory only" if here_only
                      else f"all directories, {total:,} on disk")
             self.query_one("#head", Static).update(
                 f"  {shown:,} sessions · {scope} · newest first\n"
                 f"  ENTER resume    CTRL-Y resume skipping permissions    TAB harness    "
-                f"CTRL-/ preview    ESC quit")
+                f"CTRL-G hidden    CTRL-/ preview    ESC quit")
             self.head_text = f"{shown} sessions"
 
             per_host = {h: sum(1 for r in self.all_rows if r["source"].host == h
+                               and hide_key(r) not in self.hidden
                                and keep(r, self.show_agents, self.show_scheduled, self.show_leftovers)
                                and (not self.harness or r["source"].adapter.NAME == self.harness))
                         for h in hosts}
@@ -430,6 +766,7 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
 
             def hidden(roles):
                 return sum(1 for r in self.all_rows if r.get("role") in roles
+                           and hide_key(r) not in self.hidden
                            and (not self.host or r["source"].host == self.host)
                            and (not self.harness or r["source"].adapter.NAME == self.harness))
             n_agents, n_sched = hidden(AGENT), hidden(SCHEDULED)
@@ -440,13 +777,16 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.query_one("#toggle", Static).update(self.toggle_text)
             sched = self.query_one("#sched", Static)
             sched.update(self.sched_text)
-            sched.set_class(n_sched == 0, "hidden")
             n_left = hidden(LEFTOVER)
             self.left_text = (f"[ CTRL-B ] job leftovers "
                               f"{'shown' if self.show_leftovers else 'hidden'} ({n_left:,})")
-            left = self.query_one("#left", Static)
-            left.update(self.left_text)
-            left.set_class(n_left == 0, "hidden")
+            self.query_one("#left", Static).update(self.left_text)
+            self.query_one("#hide", Static).update(
+                "[ CTRL-X ] unhide this session" if self.view_hidden
+                else "[ CTRL-X ] hide this session")
+            # The toggles mean nothing in the hidden and review views.
+            self.query_one("#toggles").set_class(self.view_hidden or self.view_review, "hidden")
+            self.query_one("#hide").set_class(self.view_review, "hidden")
 
             def chip(tok, desc):
                 return f"[b #1a1b26 on #7dcfff] {tok} [/][#565f89] {desc}[/]"
@@ -460,13 +800,77 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             self.query_one("#labels", Static).update("  " + header(namew))
 
         def update_preview(self):
+            """Show the highlighted row's preview without ever blocking the UI.
+
+            Reading a large transcript (cost alone reads the whole file, about
+            a second at 190 MB) runs in a separate process: in a thread, its
+            JSON parsing holds the GIL and the UI still stutters. Results are
+            cached per session, so moving back to a row is instant; a cached
+            result older than 10 s is shown and then refreshed. A result for a
+            row the cursor has already left is dropped.
+            """
             pane = self.query_one("#preview_body", Static)
             lv = self.query_one("#list", ListView)
+            if self._preview_timer:
+                self._preview_timer.stop()
             if not self._visible or lv.index is None:
-                pane.update("")
+                self._preview_key = None
+                pane.update("  scanning for spawned sessions… (a few seconds the first time)"
+                            if self.view_review and self.review_rows is None else "")
                 return
             row = self._visible[min(lv.index, len(self._visible) - 1)]
-            pane.update(preview(row, max(40, self.size.width - 6)))
+            width = max(40, self.size.width - 6)
+            key = (row["source"].tag, row["id"], width, bool(row.get("review")),
+                   row.get("review_verdict"), row.get("role"))
+            self._preview_key = key
+            cached = self._previews.get(key)
+            if cached:
+                pane.update(cached[1])
+                # A live session keeps growing: show what we have at once, and
+                # re-read it in the background if that is more than 10 s old.
+                if time.time() - cached[0] < 10:
+                    return
+            else:
+                pane.update(f"{row['name']}\n\n  loading…")
+            # Debounce: holding an arrow key fires one read for the row it
+            # stops on, not one per row passed. exclusive: moving on cancels a
+            # read that hasn't started, so the row you stop on isn't queued
+            # behind every row you passed.
+            self._preview_timer = self.set_timer(
+                0.06, lambda: self.run_worker(self.load_preview(row, width, key),
+                                              group="preview", exclusive=True))
+
+        async def load_preview(self, row, width, key):
+            if key != self._preview_key:
+                return
+            from concurrent.futures.process import BrokenProcessPool
+            loop = asyncio.get_running_loop()
+            try:
+                text = await loop.run_in_executor(self._pool, preview, row, width)
+            except BrokenProcessPool:
+                # A worker died (out of memory on a huge file, say). A new pool
+                # can't be spawned under Textual, so carry on in a thread.
+                self._pool = None
+                try:
+                    text = await loop.run_in_executor(None, preview, row, width)
+                except Exception as exc:  # noqa: BLE001
+                    if key == self._preview_key:
+                        self.query_one("#preview_body", Static).update(
+                            f"could not read this session: {exc.__class__.__name__}: {exc}")
+                    return      # not cached: the next visit tries again
+            except Exception as exc:  # noqa: BLE001
+                text = f"could not read this session: {exc.__class__.__name__}: {exc}"
+                if key == self._preview_key:
+                    self.query_one("#preview_body", Static).update(text)
+                return          # not cached: the next visit tries again
+            self.show_preview(key, text)
+
+        def show_preview(self, key, text):
+            if len(self._previews) > 200:
+                self._previews.clear()
+            self._previews[key] = (time.time(), text)
+            if key == self._preview_key:
+                self.query_one("#preview_body", Static).update(text)
 
         # -- events ----------------------------------------------------------
         def on_input_submitted(self, event):
@@ -483,9 +887,10 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
             # Clicking a tab moves focus to the tab bar; typing should keep
             # going to the search box.
             self.query_one("#search", Input).focus()
-            if want != self.harness:
+            if want != self.harness or self.view_hidden or self.view_review:
                 self.harness = want
-                self.run_worker(self.refresh_rows(keep_index=False), exclusive=True)
+                self.view_hidden = self.view_review = False
+                self.run_worker(self.refresh_rows(keep_index=False))
 
         def on_list_view_highlighted(self, event):
             self.update_preview()
@@ -539,36 +944,205 @@ def build_app(rows, query, yolo, total, here_only, sources, harness=None, host=N
 
         def action_cycle_tab(self, step):
             order = [None] + harnesses
-            nxt = order[(order.index(self.harness) + step) % len(order)]
+            # From the hidden view, TAB returns to the harness you came from.
+            nxt = (self.harness if self.view_hidden or self.view_review
+                   else order[(order.index(self.harness) + step) % len(order)])
             # Setting the active tab fires TabActivated, which refreshes.
             self.query_one("#tabs", Tabs).active = f"t-{nxt or 'all'}"
 
         def action_cycle_host(self):
+            if self.view_review:
+                return
             order = [None] + hosts
             self.host = order[(order.index(self.host) + 1) % len(order)]
-            self.run_worker(self.refresh_rows(keep_index=False), exclusive=True)
+            self.run_worker(self.refresh_rows(keep_index=False))
 
         def action_toggle_agents(self):
+            if self.view_hidden or self.view_review:    # those views ignore filters
+                return
             self.show_agents = not self.show_agents
-            self.run_worker(self.refresh_rows(keep_index=False), exclusive=True)
+            self.run_worker(self.refresh_rows(keep_index=False))
 
         def action_toggle_scheduled(self):
+            if self.view_hidden or self.view_review:    # those views ignore filters
+                return
             self.show_scheduled = not self.show_scheduled
-            self.run_worker(self.refresh_rows(keep_index=False), exclusive=True)
+            self.run_worker(self.refresh_rows(keep_index=False))
+
+        def action_toggle_review(self):
+            """F12: show the Review tab and open it; again: hide it."""
+            if self.view_review:
+                self.review_on = False
+                self.action_cycle_tab(0)
+                return
+            self.review_on = True
+            self.action_show_review()
+
+        def action_show_review(self):
+            if self.view_review:               # a click on the open tab closes it
+                self.action_toggle_review()
+                return
+            self.view_review, self.view_hidden = True, False
+            self.query_one("#tabs", Tabs).active = ""
+            if self.review_rows is None:
+                if not self._review_loading:
+                    self._review_loading = True
+                    self.run_worker(self.load_review_rows, thread=True, group="review")
+                # Empty the list meanwhile, so nothing stale is on show.
+                self.run_worker(self.refresh_rows(keep_index=False))
+            else:
+                self.run_worker(self.refresh_rows(keep_index=False))
+
+        def load_review_rows(self):
+            rows, problems = review_rows(sources)
+            self.call_from_thread(self.review_loaded, rows, problems)
+
+        def review_loaded(self, rows, problems=()):
+            self._review_loading = False
+            self.review_rows = rows
+            for p in problems:
+                self.notify(p, severity="error", timeout=30)
+            if self.view_review:
+                self.run_worker(self.refresh_rows(keep_index=False))
+
+        def action_mark(self, verdict):
+            """Record Phil's verdict on the selected session, then move on.
+
+            Synchronous: the row, the counts and the cursor change before the
+            next key is read, so marking quickly never drops or misplaces one."""
+            lv = self.query_one("#list", ListView)
+            if not self.view_review:
+                return
+            # Not while the scan is loading: the list on screen is not yet
+            # the review list, so the mark would land on the wrong session.
+            if self.review_rows is None:
+                self.notify("still scanning: nothing marked yet")
+                return
+            cur = self._current()
+            if cur is None:
+                return
+            i, row = cur
+            # The file may have marks from another hopback: re-read it, then
+            # apply this mark and any an earlier failed save still holds.
+            self._unsaved[row["id"]] = verdict or None
+            failed, seen = None, len(STATE_PROBLEMS)
+            try:
+                marks = load_review()
+            except OSError as exc:             # unreadable: never save over it
+                marks, failed = dict(self.review), exc
+            if len(STATE_PROBLEMS) > seen:     # found damaged and set aside: keep what we hold
+                marks = {**self.review, **marks}
+            for sid, v in self._unsaved.items():
+                if v:
+                    marks[sid] = v
+                else:
+                    marks.pop(sid, None)
+            self.review = marks
+            if failed is None:
+                try:
+                    save_review(marks)
+                    self._unsaved.clear()
+                except OSError as exc:
+                    failed = exc
+            if failed is not None:
+                self.notify(f"couldn't save the verdict ({failed}); kept here, saved with the next mark",
+                            severity="warning")
+            self.report_state()
+            apply_review(self.all_rows, self.review)   # shows at once in the main list
+            row["review_verdict"] = self.review.get(row["id"])
+            row["review_mark"] = REVIEW_MARKS[row["review_verdict"]]
+            lv.children[i].query_one(Static).update(
+                fmt(row, self._namew, str(Path.home()), time.time()))
+            self.update_header(self._namew)
+            if i + 1 < len(self._visible):
+                lv.index = i + 1                       # the highlight event refreshes the preview
+            else:
+                self.update_preview()                  # same row, new verdict
+
+        def on_key(self, event):
+            """The mark keys work wherever focus is: a click on a row or a tab
+            moves focus to the list, which ignores digits, and they bubble up
+            here. (The search box handles them itself, typing them once a
+            search has begun.)"""
+            if (self.view_review and event.character in ("0", "1", "2", "3")
+                    and not isinstance(self.focused, Input)):
+                event.stop()
+                self.action_mark({"1": "accepted", "2": "rejected", "3": "discuss"}
+                                 .get(event.character))
+
+        def report_state(self):
+            """Show (once) what went wrong reading saved state."""
+            while STATE_PROBLEMS:
+                self.notify(STATE_PROBLEMS.pop(0), severity="warning", timeout=30)
+
+        def action_show_hidden(self):
+            if self.view_hidden:
+                return
+            self.view_hidden, self.view_review = True, False
+            # No harness tab is active while the hidden view is up; activating
+            # one (click or TAB) leaves it.
+            self.query_one("#tabs", Tabs).active = ""
+            self.run_worker(self.refresh_rows(keep_index=False))
+
+        def action_toggle_hide(self):
+            if self.view_review:
+                self.notify("leave the Review view to hide sessions")
+                return
+            cur = self._current()
+            if cur is None:
+                return
+            key = hide_key(cur[1])
+            hide = key not in self.hidden
+            # Re-read first, and apply only this change: another open picker
+            # may have changed the list since this one started.
+            seen = len(STATE_PROBLEMS)
+            try:
+                fresh = load_hidden()
+            except OSError as exc:             # unreadable: never save over it
+                self.notify(f"couldn't read the hidden list ({exc}); nothing changed", severity="error")
+                return
+            # Found damaged and set aside: keep what this picker holds.
+            self.hidden = fresh | self.hidden if len(STATE_PROBLEMS) > seen else fresh
+            self.report_state()
+            if hide:
+                self.hidden.add(key)
+            else:
+                self.hidden.discard(key)
+            try:
+                save_hidden(self.hidden)
+            except OSError as exc:
+                self.notify(f"couldn't save the hidden list ({exc}); it lasts until you quit",
+                            severity="warning")
+            self.run_worker(self.refresh_rows())
 
         def action_toggle_leftovers(self):
+            if self.view_hidden or self.view_review:    # those views ignore filters
+                return
             self.show_leftovers = not self.show_leftovers
-            self.run_worker(self.refresh_rows(keep_index=False), exclusive=True)
+            self.run_worker(self.refresh_rows(keep_index=False))
 
         def action_toggle_preview(self):
             self.query_one("#preview").toggle_class("hidden")
 
-        def action_resume(self, yolo=False):
+        def _current(self):
+            """(index, row) under the cursor, or None. None from the moment a
+            rebuild is requested until it is on screen: the cursor and the
+            rows then belong to different lists, so acting would hit the
+            wrong session."""
             lv = self.query_one("#list", ListView)
+            if self._shown_ticket != self._refresh_ticket:
+                self.notify("the list is updating, press again")
+                return None
             if not self._visible or lv.index is None:
+                return None
+            i = min(lv.index, len(self._visible) - 1)
+            return i, self._visible[i]
+
+        def action_resume(self, yolo=False):
+            cur = self._current()
+            if cur is None:
                 return
-            self.result = (self._visible[min(lv.index, len(self._visible) - 1)],
-                           self.yolo or yolo)
+            self.result = (cur[1], self.yolo or yolo)
             self.exit()
 
         def action_resume_yolo(self):
@@ -636,7 +1210,8 @@ def main():
                     help="optional harness name, then words to pre-filter on")
     ap.add_argument("--host", choices=sorted(HOSTS), help="only sessions from this host")
     ap.add_argument("-n", type=int, default=300, metavar="N",
-                    help="how many sessions to load per store (default 300)")
+                    help="how many sessions to load per store (default 300; sessions you "
+                         "rejected in Review come on top)")
     ap.add_argument("-a", "--all", action="store_true", help="load every session")
     ap.add_argument("-d", "--here", action="store_true", help="only the current directory")
     ap.add_argument("-e", "--empty", action="store_true",
@@ -650,6 +1225,11 @@ def main():
     ap.add_argument("-b", "--background", action="store_true",
                     help="include background-job leftovers: older copies of sessions that "
                          "moved into a background job, and runs in a job's scratch directory")
+    ap.add_argument("--review", action="store_true",
+                    help="open the picker on the Review view (F12): check each session "
+                         "the spawn detector marked and accept or reject it")
+    ap.add_argument("--hidden", action="store_true",
+                    help="only the sessions you hid with CTRL-X (opens the picker's Hidden view)")
     ap.add_argument("--archived", action="store_true", help="include archived sessions")
     ap.add_argument("-l", "--list", action="store_true", help="print a list, no picker")
     ap.add_argument("-y", "--yolo", "--dangerous", dest="yolo", action="store_true",
@@ -690,8 +1270,9 @@ def main():
             try:
                 hits += [(src, i) for i in src.adapter.ids(src.root)
                          if i == want or (args.id and i.startswith(want))]
-            except Exception:  # noqa: BLE001
-                continue
+            except Exception as exc:  # noqa: BLE001 - one bad store mustn't hide the others
+                print(f"{src.tag}: could not read {src.root} ({exc.__class__.__name__}: {exc})",
+                      file=sys.stderr)
         if not hits:
             sys.exit(f"no session id {'starts with' if args.id else 'is'} {want!r}")
         if len(hits) > 1 and args.id:
@@ -703,8 +1284,10 @@ def main():
         if args.id:
             print(sid)
             return
-        rows, _, _ = load_rows([src], None, False, False, include_teams=True,
-                               include_scratch=True, include_empty=True, include_archived=True)
+        rows, _, warns = load_rows([src], None, False, False, include_teams=True,
+                                   include_scratch=True, include_empty=True, include_archived=True)
+        for w in warns:
+            print(f"warning: {w}", file=sys.stderr)
         row = next((r for r in rows if r["id"] == sid), None)
         if row is None:
             sys.exit(f"session {sid} could not be read")
@@ -715,19 +1298,31 @@ def main():
     # hidden unless asked for. The picker loads them regardless, so its
     # toggles can reveal them without a rescan.
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.list
-    load_hidden = interactive or args.teams or args.scheduled or args.background
+    load_skipped = interactive or args.teams or args.scheduled or args.background
     rows, total, warnings = load_rows(
-        scoped, None if args.all else args.n, args.here, args.deep,
-        include_teams=load_hidden, include_scratch=args.scratch, include_empty=args.empty,
+        # Hidden sessions can be any age, so finding them means loading all.
+        scoped, None if args.all or args.hidden else args.n, args.here, args.deep,
+        include_teams=load_skipped, include_scratch=args.scratch, include_empty=args.empty,
         include_archived=args.archived,
-        limit_counts_visible=load_hidden and not (args.teams and args.scheduled and args.background))
+        limit_counts_visible=load_skipped and not (args.teams and args.scheduled and args.background))
     for w in warnings:
         print(f"warning: {w}", file=sys.stderr)
     if not rows:
         sys.exit("no sessions found")
+    try:
+        # Unreadable saved state stops here, before anything can save over it.
+        load_hidden()
+        load_review()
+    except OSError as exc:
+        sys.exit(f"hopback: cannot read {exc.filename}: {exc.strerror}")
 
     if not interactive:
-        rows = [r for r in rows if keep(r, args.teams, args.scheduled, args.background)]
+        while STATE_PROBLEMS:
+            print(f"warning: {STATE_PROBLEMS.pop(0)}", file=sys.stderr)
+        apply_review(rows, load_review())
+        hid = load_hidden()
+        rows = [r for r in rows if (hide_key(r) in hid) == args.hidden
+                and (args.hidden or keep(r, args.teams, args.scheduled, args.background))]
         if text:
             rows = rank(rows, text)
         if not rows:
@@ -742,7 +1337,7 @@ def main():
     chosen, yolo = pick(rows, text, args.yolo, total, args.here, scoped,
                         harness=harness, host=args.host, show_agents=args.teams,
                         show_scheduled=args.scheduled, show_leftovers=args.background,
-                        warnings=warnings)
+                        warnings=warnings, start_hidden=args.hidden, start_review=args.review)
     if not chosen:
         return
     src = chosen["source"]
@@ -764,11 +1359,50 @@ def main():
 
     tag = "  [skip-permissions]" if yolo else ""
     print(f"→ {chosen['name']}  ({src.label}){tag}", file=sys.stderr)
+    if src.adapter.NAME == "claude" and src.host == this_host() and hasattr(os, "getuid"):
+        tmp = Path(os.environ.get("CLAUDE_CODE_TMPDIR") or "/tmp") / f"claude-{os.getuid()}"
+        bad = foreign_owned(tmp)
+        if bad:
+            conf = Path("/etc/tmpfiles.d/claude.conf")
+            sys.exit(f"claude will refuse to start: these paths under {tmp} are not owned by you:\n  "
+                     + "\n  ".join(bad[:20])
+                     + (f"\n  ... and {len(bad) - 20} more" if len(bad) > 20 else "")
+                     + "\nUsually a Docker bind mount recreated them as root. Fix: sudo rm -rf "
+                       "the listed paths"
+                     + (f", then run: sudo systemd-tmpfiles --create {conf}" if conf.exists() else ""))
     os.chdir(target)
     try:
         os.execvp(argv[0], argv)
     except OSError as exc:
         sys.exit(f"could not run {argv[0]}: {exc}")
+
+
+def foreign_owned(root, budget=1.0):
+    """Paths under `root` (or root itself) not owned by this user; Claude Code
+    refuses to start, with a generic error, when its /tmp directory has any.
+    Symlinks are not followed. A missing root means nothing to report, and a
+    walk that takes longer than `budget` seconds is abandoned rather than
+    holding up the resume."""
+    uid, out = os.getuid(), []
+    try:
+        if root.lstat().st_uid != uid:
+            return [str(root)]
+    except OSError:
+        return []      # missing or unreadable: nothing this check can say
+    deadline = time.monotonic() + budget
+    # Only an owner mismatch is reported. An unreadable directory the user
+    # owns, or one a running session deletes mid-walk, is not this problem.
+    for dirpath, dirs, files in os.walk(root, onerror=lambda e: None):
+        for name in dirs + files:
+            if time.monotonic() > deadline:
+                return out
+            path = os.path.join(dirpath, name)
+            try:
+                if os.lstat(path).st_uid != uid:
+                    out.append(path)
+            except OSError:
+                pass
+    return out
 
 
 def run():

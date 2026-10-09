@@ -3,8 +3,8 @@ name = "hopback"
 version = "0.2.0"
 description = "Browse and resume AI coding-agent sessions from any directory"
 readme = "README.md"
-requires-python = ">=3.9"
-dependencies = ["textual>=8.2"]
+requires-python = ">=3.10"
+dependencies = ["textual>=8.2", "tree-sitter>=0.23", "tree-sitter-bash>=0.23"]
 
 [project.scripts]
 hopback = "hopback.cli:run"
