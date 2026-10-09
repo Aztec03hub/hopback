@@ -4,6 +4,7 @@ Every function takes the store ROOT (the .claude directory) rather than reading
 a global, so one process can read several Claude stores, e.g. WSL and Windows.
 """
 import json
+import math
 import re
 import threading
 import time
@@ -444,6 +445,30 @@ _RATES = {}  # store -> [(path, {model: rate}), ...], newest file first
 _RATES_LOCK = threading.Lock()
 
 
+def _num(v):
+    """`v` if it is a finite number, else None: a cost record is data from disk."""
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    return v if ok else None
+
+
+_WEIGHTS = (("inputTokens", 1), ("outputTokens", 5), ("cacheReadInputTokens", 0.1),
+            ("cacheCreationInputTokens", 1.25))
+
+
+def _entry_rate(u):
+    """Dollars per weighted token from one modelUsage entry, or None when the
+    entry is malformed (not a dict, a token count or the cost null, a string,
+    NaN) or has no cost. A count that is absent counts as 0."""
+    if not isinstance(u, dict):
+        return None
+    cost = _num(u.get("costUSD"))
+    counts = [(_num(u[k]) if k in u else 0, wt) for k, wt in _WEIGHTS]
+    if cost is None or cost <= 0 or any(c is None for c, _ in counts):
+        return None
+    w = sum(c * wt for c, wt in counts)
+    return cost / w if w > 0 else None
+
+
 def _file_rates(store, max_files):
     """Each recent file's per-model rates, read once per store per process.
 
@@ -452,21 +477,34 @@ def _file_rates(store, max_files):
     is far too slow to repeat on every preview, so the scan is kept, misses
     included. (From the desktop's perf-preview-cache branch, measured there:
     a preview build went from a median 564 ms to about 85 ms.)
+
+    Known difference from the old per-call scan: the rates are read once per
+    process. A model first used after hopback started shows no rate (its live
+    sessions stay unpriced) until the next launch. The cache is also keyed on
+    the store alone, so the first caller's max_files wins (every caller uses 200).
+
+    A malformed model entry (null or non-numeric tokens, no dollars) gives no
+    rate for that model; a file that vanishes between the glob and the stat is
+    not a candidate. Neither stops the other models or files.
     """
     with _RATES_LOCK:
         if store not in _RATES:
-            files = sorted(store.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime,
-                           reverse=True)
+            dated = []
+            for p in store.glob("*/*.jsonl"):
+                try:
+                    dated.append((p.stat().st_mtime, p))
+                except OSError:        # deleted since the glob: not a candidate
+                    continue
+            dated.sort(key=lambda d: d[0], reverse=True)
             found = []
-            for path in files[:max_files]:
+            for _, path in dated[:max_files]:
                 _, rec = last_line_with(path, COST_MARK)
+                usage = rec.get("modelUsage") if isinstance(rec, dict) else None
                 rates = {}
-                for model, u in ((rec or {}).get("modelUsage") or {}).items():
-                    w = (u.get("inputTokens", 0) + 5 * u.get("outputTokens", 0)
-                         + 0.1 * u.get("cacheReadInputTokens", 0)
-                         + 1.25 * u.get("cacheCreationInputTokens", 0))
-                    if w and u.get("costUSD"):
-                        rates[model] = u["costUSD"] / w
+                for model, u in (usage if isinstance(usage, dict) else {}).items():
+                    rate = _entry_rate(u)
+                    if rate is not None:
+                        rates[model] = rate
                 if rates:
                     found.append((path, rates))
             _RATES[store] = found
