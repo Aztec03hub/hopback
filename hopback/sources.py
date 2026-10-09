@@ -86,7 +86,7 @@ class Source:
             return [ps, "-NoLogo", "-NoProfile", "-Command", script], run_in, shown
         shown = " ".join(shq(a) for a in argv)
         if cwd:
-            shown = f"cd {shq(cwd)} && {shown}"
+            shown = f"cd -- {shq(cwd)} && {shown}"
         return argv, cwd, shown
 
 

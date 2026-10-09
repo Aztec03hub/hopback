@@ -37,14 +37,14 @@ def safe_text(text, line=False):
 def shq(text):
     """`text` as one shell word that bash and zsh read back as exactly `text`,
     with no control, invisible or bidi character in the printed form: those
-    become $'...' byte escapes (\\xNN of the UTF-8 bytes, so the path is unchanged)."""
+    become $'...' byte escapes (\\xNN of the UTF-8 bytes, so the path is unchanged).
+    A quote and a backslash are escaped the same way, so no ' ever appears inside
+    the $'...': a shell without $'..' (dash, sh) then sees an inert literal."""
     if not CONTROL_LINE.search(text):
         return shlex.quote(text)
 
     def esc(m):
         c = m.group()
-        if c in "\\'":
-            return "\\" + c
         try:
             raw = c.encode("utf-8", "surrogateescape")   # a file name's undecodable byte
         except UnicodeEncodeError:

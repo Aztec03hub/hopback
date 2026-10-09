@@ -341,7 +341,7 @@ def first_prompt(path, max_lines=400):
 COST_MARK = b'"type":"cost-state"'
 
 
-def last_line_with(path, marker, chunk=4 * 1024 * 1024):
+def last_line_with(path, marker, chunk=4 * 1024 * 1024, errors=None):
     """(offset just past it, parsed record) of the LAST line containing marker.
 
     Reads backwards in chunks with no size limit, because a resumed session can
@@ -368,8 +368,9 @@ def last_line_with(path, marker, chunk=4 * 1024 * 1024):
                 cut = buf.find(b"\n")
                 tail = buf[:cut] if cut >= 0 else buf
                 pos = start
-    except OSError:
-        pass
+    except OSError as exc:
+        if errors is not None:     # the caller can tell unreadable from absent
+            errors.append(exc)
     return None, None
 
 
@@ -499,8 +500,13 @@ def _file_rates(store, max_files):
     with lock:                      # only a caller of the SAME store waits
         if store in _RATES:
             return _RATES[store]
-        dated = []
-        for p in store.glob("*/*.jsonl"):
+        dated, errors = [], []
+        try:
+            paths = list(store.glob("*/*.jsonl"))
+        except OSError as exc:     # an unlistable store: no files this time, retry later
+            errors.append(exc)
+            paths = []
+        for p in paths:
             try:
                 dated.append((p.stat().st_mtime, p))
             except OSError:        # deleted since the glob: not a candidate
@@ -510,7 +516,7 @@ def _file_rates(store, max_files):
         for _, path in dated[:max_files]:
             if STOP.is_set():      # the app is closing: give up, cache nothing
                 return found
-            _, rec = last_line_with(path, COST_MARK)
+            _, rec = last_line_with(path, COST_MARK, errors=errors)
             usage = rec.get("modelUsage") if isinstance(rec, dict) else None
             rates = {}
             for model, u in (usage if isinstance(usage, dict) else {}).items():
@@ -522,7 +528,7 @@ def _file_rates(store, max_files):
         # Cache a scan that saw files. A store with none (an unmounted drive, a
         # glob that came back empty) may be a hiccup, so the next call retries;
         # an empty store costs one glob to retry.
-        if dated:
+        if dated and not errors:   # an unreadable listed file also means retry
             _RATES[store] = found
         return found
 

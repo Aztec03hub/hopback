@@ -16,7 +16,9 @@ Three numbers:
                   hammered with app.action_cursor_down/up (no Pilot waits). The
                   worst gap is the longest the UI froze.
 
-Works against any revision: if hopback.previewcache exists, the picker gets a
+Works against any revision. NOTE: hopback.previewcache does not exist on perf-s2 (it is
+only on the desktop branch), so here the --cache/--no-cache flags and the Previewer
+branch are inert and the app's own preview code is measured. If hopback.previewcache exists, the picker gets a
 Previewer (persisting to --cache, default a throwaway file, so a first run
 is cold and a second is warm); otherwise the app's own preview code is used.
 """

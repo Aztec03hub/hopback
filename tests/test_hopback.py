@@ -19,21 +19,27 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-TMP = Path(tempfile.mkdtemp(prefix="hopback-test-"))
-HOME, WIN = TMP / "home", TMP / "winhome"
-HOME.mkdir()
-WIN.mkdir()
-os.environ["HOME"] = str(HOME)
-os.environ["HOPBACK_WINDOWS_HOME"] = str(WIN)
-os.environ["XDG_STATE_HOME"] = str(TMP / "state")  # never the real hidden list
-os.environ["XDG_CACHE_HOME"] = CACHE = str(TMP / "cache")   # nor the real launch cache
+_WORKER = __name__ == "__mp_main__"   # a spawn child re-imports this file: it must not leak a store
+if _WORKER:
+    TMP = Path(os.environ["XDG_STATE_HOME"]).parent   # the parent's store, inherited
+    HOME, WIN = TMP / "home", TMP / "winhome"
+    CACHE = os.environ["XDG_CACHE_HOME"]
+else:
+    TMP = Path(tempfile.mkdtemp(prefix="hopback-test-"))
+    HOME, WIN = TMP / "home", TMP / "winhome"
+    HOME.mkdir()
+    WIN.mkdir()
+    os.environ["HOME"] = str(HOME)
+    os.environ["HOPBACK_WINDOWS_HOME"] = str(WIN)
+    os.environ["XDG_STATE_HOME"] = str(TMP / "state")  # never the real hidden list
+    os.environ["XDG_CACHE_HOME"] = CACHE = str(TMP / "cache")   # nor the real launch cache
 
 import demo_store  # noqa: E402
 from hopback import cli, paths, readers  # noqa: E402
 from hopback.adapters import AGENT, claude  # noqa: E402
 from hopback.sources import discover  # noqa: E402
 
-IDS = demo_store.build(HOME, WIN)
+IDS = {} if _WORKER else demo_store.build(HOME, WIN)
 
 
 async def until(p, cond, what, timeout=60):
@@ -372,9 +378,102 @@ def test_model_rates_survive_malformed_records_and_vanished_files():
     assert r.keys() == {"opus"} and abs(r["opus"] - 5.0) < 1e-9, r   # a bad entry costs only itself
     # The worker initializer cannot raise on such data either.
     claude._RATES.clear()
-    cli._pool_init(os.getppid(), (str(store),)).join()
+    with mock.patch.object(cli, "_exit_with_parent"):   # the warm thread is under test, not the watcher
+        cli._pool_init(os.getppid(), (str(store),)).join()
     assert store in claude._RATES
     claude._RATES.clear()
+
+
+def _cost_store(base, n=1, cost=True):
+    """A throwaway store with n session files, each with (or without) a cost-state line."""
+    proj = base / "projects" / "p"
+    proj.mkdir(parents=True)
+    for i in range(n):
+        line = ('{"type":"cost-state","modelUsage":{"opus":{"inputTokens":1000000,"costUSD":5.0}}}\n'
+                if cost else '{"type":"user"}\n')
+        (proj / f"s{i}.jsonl").write_text(line)
+    return base / "projects"
+
+
+def test_an_unreadable_or_unlistable_store_is_retried_not_cached():
+    import io
+    import contextlib
+    store = _cost_store(TMP / "r3-unreadable")
+    f = next(store.glob("*/*.jsonl"))
+    f.chmod(0)
+    try:
+        claude._RATES.clear()
+        if os.geteuid() != 0:
+            assert claude.model_rates({"opus"}, store) == [] or not claude.model_rates({"opus"}, store)
+            assert store not in claude._RATES
+            f.chmod(0o600)
+            assert "opus" in claude.model_rates({"opus"}, store)
+    finally:
+        f.chmod(0o600)
+    # A glob that fails with EIO: nothing on stderr from the warm thread, nothing cached.
+    claude._RATES.clear()
+    err = io.StringIO()
+    with mock.patch.object(Path, "glob", side_effect=OSError(5, "EIO")), \
+            mock.patch.object(cli, "_exit_with_parent"), contextlib.redirect_stderr(err), \
+            mock.patch("threading.excepthook") as hook:
+        cli._pool_init(os.getppid(), (str(store),)).join()
+        assert not claude.model_rates({"opus"}, store)
+    assert not hook.called and err.getvalue() == "" and store not in claude._RATES, (err.getvalue(), hook.call_args)
+    claude._RATES.clear()
+
+
+def test_rate_scan_caches_misses_and_runs_once_across_threads():
+    import threading
+    store = _cost_store(TMP / "r3-miss", n=3, cost=False)      # files, but no rate in any
+    real = claude.last_line_with
+    calls = []
+    claude._RATES.clear()
+    claude.last_line_with = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        for _ in range(3):
+            assert claude.model_rates({"nobody"}, store) == {} or not claude.model_rates({"nobody"}, store)
+        assert len(calls) == 3 and claude._RATES[store] == [], (len(calls), claude._RATES.get(store))
+        # Two threads on one cold store: the scan runs once (the lock), not twice.
+        claude._RATES.clear()
+        calls.clear()
+        entered, gate = threading.Event(), threading.Event()
+
+        def slow(*a, **k):
+            calls.append(1)
+            entered.set()
+            gate.wait(60)
+            return real(*a, **k)
+        claude.last_line_with = slow
+        ts = [threading.Thread(target=claude.model_rates, args=({"nobody"}, store)) for _ in range(2)]
+        ts[0].start()
+        assert entered.wait(60)
+        ts[1].start()
+        gate.set()
+        for t in ts:
+            t.join(60)
+        assert len(calls) == 3, len(calls)
+    finally:
+        claude.last_line_with = real
+        claude._RATES.clear()
+
+
+def test_pool_init_warms_every_store_and_only_claude_roots_are_handed_over():
+    a, b = _cost_store(TMP / "r3-a"), _cost_store(TMP / "r3-b")
+    claude._RATES.clear()
+    with mock.patch.object(cli, "_exit_with_parent"):
+        cli._pool_init(os.getppid(), (str(a), str(b))).join()
+    assert a in claude._RATES and b in claude._RATES, list(claude._RATES)
+    claude._RATES.clear()
+    seen = []
+    with mock.patch.object(cli, "preview_pool", side_effect=lambda stores=(): seen.append(list(stores))):
+        async def drive():
+            rows, total = load()
+            app = cli.build_app(rows, "", False, total, False, discover())
+            async with app.run_test(size=(120, 30)) as p:
+                await p.pause()
+        asyncio.run(drive())
+    claude_roots = sorted({str(s.root / "projects") for s in discover() if s.adapter is claude})
+    assert len(claude_roots) >= 2 and seen and seen[0] == claude_roots, (seen, claude_roots)
 
 
 def test_a_cached_store_is_not_blocked_by_a_scan_of_another():
@@ -471,7 +570,8 @@ def test_pool_init_warms_in_the_background_and_scans_once():
         return real(*a, **k)
     claude.last_line_with = slow
     try:
-        thread = cli._pool_init(os.getppid(), (str(store),))
+        with mock.patch.object(cli, "_exit_with_parent"):
+            thread = cli._pool_init(os.getppid(), (str(store),))
         assert isinstance(thread, threading.Thread) and thread.daemon
         assert entered.wait(60), "the scan never started"
         # A preview with no cost (Codex) does not wait for it ...
@@ -1277,7 +1377,7 @@ def test_untrusted_text_reaches_no_sink_raw():
     src = row(IDS["claude-live"])["source"]
     _, cwd, shown = src.launch({**bad, "source": src, "id": "abc"}, False)
     assert cwd == bad["cwd"] and "\x1b" in cwd
-    assert shown.startswith("cd $'/tmp/EVIL\\x1b]0;PWNED") and not _has_bad(shown), shown
+    assert shown.startswith("cd -- $'/tmp/EVIL\\x1b]0;PWNED") and not _has_bad(shown), shown
     rtl_dir = "/tmp/\N{HEBREW LETTER ALEF}\N{RIGHT-TO-LEFT EMBEDDING}x"
     rtl = src.launch({**bad, "source": src, "id": "abc", "cwd": rtl_dir}, False)
     assert rtl[1] == rtl_dir and "\N{HEBREW LETTER ALEF}" in rtl[2] and not _has_bad(rtl[2]), rtl[2]
@@ -1351,8 +1451,12 @@ def test_untrusted_text_reaches_no_sink_raw():
     res = _run_main("--print-cd", chosen={**real, "cwd": "/no/such/\N{HEBREW LETTER ALEF}"})
     assert "\N{HEBREW LETTER ALEF}" in res.out and not res.exec.called, (res.out, res.err)
     res = _run_main("--print-cd", chosen={**real, "cwd": "/no/such/dir\r\N{RIGHT-TO-LEFT OVERRIDE}"})
-    assert res.out.startswith("cd $'/no/such/dir\\x0d\\xe2\\x80\\xae' && claude --resume "), res.out
+    assert res.out.startswith("cd -- $'/no/such/dir\\x0d\\xe2\\x80\\xae' && claude --resume "), res.out
     assert not _has_bad(res.out) and not res.exec.called
+    res = _run_main("--print-cd", chosen={**real, "cwd": "/tmp/a\x00b"})   # a clean message, no traceback
+    assert "refusing" in res.err and not res.out, (res.out, res.err)
+    res = _run_main("--print-cd", chosen={**real, "cwd": "-"})
+    assert res.out.startswith("cd -- - && "), res.out
     # A directory that really ends in a CR is resumed in exactly that directory.
     crdir = TMP / "crdir\r"
     crdir.mkdir()
@@ -1405,10 +1509,29 @@ def test_printed_command_round_trips_through_a_shell():
     import shutil as _sh
     import subprocess
     from hopback.fmt import shq
-    samples = ["plain", "with space", "it's", "back\\slash", "$(not run) `x` $HOME", "tab\there",
+    samples = ["plain", "with space", "it's", "a'; true #\t", "q'\n'", "back\\slash", "$(not run) `x` $HOME", "tab\there",
                "cr\r", "esc\x1b[2J", "c1\x9b", "\N{RIGHT-TO-LEFT OVERRIDE}rlo", "\N{ZERO WIDTH SPACE}zw",
                "\N{HEBREW LETTER ALEF}\N{RIGHT-TO-LEFT EMBEDDING}x", "\N{TAG LATIN CAPITAL LETTER A}",
-               "emoji \N{ZERO WIDTH JOINER} kept", "new\nline", "\\'\x01\\", "\N{GRINNING FACE} smile", "soft\N{SOFT HYPHEN}hyphen"]
+               "emoji \N{ZERO WIDTH JOINER} kept", "new\nline", "\\'\x01\\", "\N{GRINNING FACE} smile", "soft\N{SOFT HYPHEN}hyphen",
+               "\udc80", "\udc41", "\ud83d", "a\ud83d\tb"]   # lone surrogates (valid JSON can make them)
+
+    def raw_of(text):
+        try:
+            return text.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError:
+            return text.encode("utf-8", "surrogatepass")
+    # A shell without $'..' (dash, sh) must see an inert literal, never live code.
+    for shell in ("sh", "dash"):
+        exe = _sh.which(shell)
+        if not exe:
+            continue
+        mark = TMP / "injected"
+        for text in [f"a'; touch {mark} #\t", f"q'\n'; touch {mark}; '", f"x\\'; touch {mark}; '\t", f"'\x1b'; touch {mark} #"]:
+            q = shq(text)
+            assert "'" not in q[2:-1], q
+            got = subprocess.run([exe, "-c", f"cd -- {q} 2>/dev/null; printf %s {q} 2>/dev/null"],
+                                 capture_output=True, timeout=30)
+            assert not mark.exists(), (shell, text, q, got)
     for shell in ("bash", "zsh"):
         exe = _sh.which(shell)
         if not exe:
@@ -1417,7 +1540,7 @@ def test_printed_command_round_trips_through_a_shell():
             q = shq(text)
             assert not _has_bad(q), (shell, q)
             got = subprocess.run([exe, "-c", f"printf %s {q}"], capture_output=True, timeout=30)
-            assert got.returncode == 0 and got.stdout == text.encode(), (shell, text, q, got)
+            assert got.returncode == 0 and got.stdout == raw_of(text), (shell, text, q, got)
 
 
 def test_hiding_a_row_keeps_the_viewport():

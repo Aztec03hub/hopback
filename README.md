@@ -106,7 +106,8 @@ hopback --review              open on the Review view (also F12): check every sp
 hopback -s / -e / --archived  include /tmp, empty, archived sessions
 hopback --deep                read whole Claude files (slower, finds early-only titles)
 hopback --id <prefix>         print the full id for a prefix, then exit
-hopback --print-cd            print the resume command instead of running it
+hopback --print-cd            print the resume command instead of running it (a path with control
+                              characters is written as $'...': for bash, zsh and ksh)
 hopback --doctor              list every store found and why the picker did or didn't appear
 claude-sessions               the old command: Claude Code sessions only
 ```
