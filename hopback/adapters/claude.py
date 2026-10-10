@@ -389,6 +389,46 @@ def read_mult(model):
     return next((x for k, x in READ_MULT if m.startswith(k)), READ_DEFAULT)
 
 
+def _counts(x):
+    """(input, output, read, creation total, write 5m, write 1h) of one flat usage
+    dict, or None when it is not a dict or a count is not a finite number: a
+    transcript line is data from disk."""
+    if not isinstance(x, dict):
+        return None
+    cc = x.get("cache_creation")
+    if cc is None:
+        cc = {}
+    if not isinstance(cc, dict):
+        return None
+    v = [_num(x.get(k) or 0) for k in ("input_tokens", "output_tokens",
+                                        "cache_read_input_tokens", "cache_creation_input_tokens")]
+    w1h = _num(cc.get("ephemeral_1h_input_tokens") or 0)
+    if cc.get("ephemeral_5m_input_tokens") is not None:
+        w5m = _num(cc["ephemeral_5m_input_tokens"])
+    else:
+        w5m = None if v[3] is None or w1h is None else v[3] - w1h
+    if w1h is None or w5m is None or None in v:
+        return None
+    return (*v, w5m, w1h)
+
+
+def _flats(u):
+    """The flat counts of a call: the call itself, or, when it carries nothing
+    (a compaction call), its usage.iterations[]. None if malformed."""
+    c = _counts(u)
+    if c is None:
+        return None
+    if any(c[:4]):
+        return [c]
+    its = u.get("iterations")
+    its = its if isinstance(its, list) else []
+    return [x for x in map(_counts, its) if x is not None]
+
+
+def _weight(c, model):
+    return c[0] + 5 * c[1] + read_mult(model) * c[2] + WRITE_5M * c[4] + WRITE_1H * c[5]
+
+
 def weighted_tokens(u, model=None):
     """Tokens weighted by their price relative to the input price.
 
@@ -399,36 +439,23 @@ def weighted_tokens(u, model=None):
 
     A compaction call can have zero top-level usage with the real numbers in
     usage.iterations[]; those are used when the top level carries nothing.
+    A malformed usage weighs 0.
     """
-    w = _weighted_flat(u, model)
-    if not w:
-        w = sum(_weighted_flat(it, model) for it in u.get("iterations") or ()
-                if isinstance(it, dict))
-    return w
-
-
-def _weighted_flat(u, model):
-    cc = u.get("cache_creation") or {}
-    w1h = cc.get("ephemeral_1h_input_tokens") or 0
-    w5m = cc.get("ephemeral_5m_input_tokens")
-    if w5m is None:
-        w5m = (u.get("cache_creation_input_tokens") or 0) - w1h
-    return ((u.get("input_tokens") or 0) + 5 * (u.get("output_tokens") or 0)
-            + read_mult(model) * (u.get("cache_read_input_tokens") or 0)
-            + WRITE_5M * w5m + WRITE_1H * w1h)
+    return sum(_weight(c, model) for c in _flats(u) or ())
 
 
 def raw_tokens(u):
     """Unweighted token count of a usage dict (same iterations rule as weighted_tokens)."""
-    def flat(x):
-        return sum(x.get(k) or 0 for k in ("input_tokens", "output_tokens",
-                                           "cache_read_input_tokens", "cache_creation_input_tokens"))
-    n = flat(u)
-    return n or sum(flat(it) for it in u.get("iterations") or () if isinstance(it, dict))
+    return sum(sum(c[:4]) for c in _flats(u) or ())
 
 
 def usage_by_model(path, after=None, before=None):
     return {m: w for m, (w, _) in usage_totals(path, after, before).items()}
+
+
+def _transcripts(path):
+    """A session's own file and its subagent transcripts."""
+    return [path, *(path.parent / path.stem / "subagents").glob("*.jsonl")]
 
 
 def usage_totals(path, after=None, before=None):
@@ -440,8 +467,7 @@ def usage_totals(path, after=None, before=None):
     repeating the same usage, so only the last record per id is counted.
     """
     seen = {}
-    files = [path, *(path.parent / path.stem / "subagents").glob("*.jsonl")]
-    for f in files:
+    for f in _transcripts(path):
         try:
             fh = f.open("rb")
         except OSError:
@@ -452,15 +478,19 @@ def usage_totals(path, after=None, before=None):
                     continue
                 try:
                     rec = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):   # an unparsable line is no record
                     continue
-                ts = rec.get("timestamp") or ""
+                msg = rec.get("message") if isinstance(rec, dict) else None
+                if not isinstance(msg, dict):
+                    continue
+                ts = rec.get("timestamp")
+                ts = ts if isinstance(ts, str) else ""
                 if (after and ts <= after) or (before and ts > before):
                     continue
-                msg = rec.get("message") or {}
-                if msg.get("usage") and msg.get("model") and msg.get("id"):
-                    seen[msg["id"]] = (msg["model"], weighted_tokens(msg["usage"], msg["model"]),
-                                       raw_tokens(msg["usage"]))
+                model, mid, usage = msg.get("model"), msg.get("id"), msg.get("usage")
+                if (usage and isinstance(model, str) and model and isinstance(mid, str) and mid
+                        and _flats(usage) is not None):
+                    seen[mid] = (model, weighted_tokens(usage, model), raw_tokens(usage))
     out = {}
     for model, w, n in seen.values():
         o = out.setdefault(model, [0, 0])
@@ -505,13 +535,13 @@ def _entry_rate(model, u):
     if not isinstance(u, dict):
         return None
     cost = _num(u.get("costUSD"))
-    # ponytail: a modelUsage aggregate has no 5m/1h split; main sessions write
-    # ~100% 1h cache, so the cache-creation term is weighted 2x (not 1.25x).
-    # A session's OWN rate does not use this: session_cost calibrates from its
-    # per-call usage, which keeps the TTL split.
+    # This is only the fallback for a model with no per-call usage in the
+    # transcript: helper models (titles, haiku) that write 5m cache, so the
+    # aggregate's cache-creation term is weighted 1.25x. Main-session models get
+    # their rate from per-call usage (_source_rates), which keeps the TTL split.
     weights = (("inputTokens", 1), ("outputTokens", 5),
                ("cacheReadInputTokens", read_mult(model)),
-               ("cacheCreationInputTokens", WRITE_1H))
+               ("cacheCreationInputTokens", WRITE_5M))
     counts = [(_num(u[k]) if k in u else 0, wt) for k, wt in weights]
     if cost is None or cost <= 0 or any(c is None for c, _ in counts):
         return None
@@ -527,20 +557,42 @@ _BAD_SONNET_READ = (2, 1, 295)           # up to this Claude Code version, sonne
 
 
 def _version(path):
-    """Claude Code version of a transcript as a tuple, from the `version` field
-    of its first record that has one (read from the head only), else None."""
+    """Claude Code version of a transcript as a tuple: the `version` field of
+    the first record (in the first 256 KB) that has one, else None."""
     try:
         with path.open("rb") as fh:
             head = fh.read(256 * 1024)
     except OSError:
         return None
-    i = head.find(b'"version":"')
-    if i < 0:
+    for line in head.splitlines():
+        if b'"version"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        v = rec.get("version") if isinstance(rec, dict) else None
+        if isinstance(v, str):
+            try:
+                return tuple(int(x) for x in v.split("."))
+            except ValueError:
+                return None
+    return None
+
+
+def _confirmed_rate(model, u, got, ver):
+    """Base price per weighted token for `model` from its cost record entry `u`
+    (see _by_base) and the per-call (weighted, raw) totals `got`, or None when
+    the record does not confirm them: no cost, a token sum more than
+    SOURCE_TOLERANCE off, or an old sonnet-5-5 session (Claude Code 2.1.295 or
+    earlier, or a version we cannot read) whose recorded cost used a wrong read price."""
+    if not u or not got or got[0] <= 0 or u["costUSD"] <= 0 or u["tokens"] <= 0:
         return None
-    try:
-        return tuple(int(x) for x in head[i + 11:i + 40].split(b'"')[0].decode().split("."))
-    except ValueError:
+    if model.startswith("claude-sonnet-5-5") and (ver is None or ver <= _BAD_SONNET_READ):
         return None
+    if abs(got[1] - u["tokens"]) > SOURCE_TOLERANCE * u["tokens"]:
+        return None
+    return u["costUSD"] / got[0]
 
 
 def _source_rates(path, off, rec, want, budget):
@@ -554,26 +606,22 @@ def _source_rates(path, off, rec, want, budget):
     token totals within SOURCE_TOLERANCE. Returns (rates, bytes read, models
     with any per-call data or None when the transcript was not read).
     """
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return {}, 0, None
+    size = 0
+    for f in _transcripts(path):      # subagent transcripts are read too, so they count
+        try:
+            size += f.stat().st_size
+        except OSError:
+            continue
     if size > SOURCE_MAX_BYTES or size > budget:
         return {}, 0, None
     usage = _by_base(rec.get("modelUsage"))
-    when = time_before(path, off)
-    mine = usage_totals(path, before=when)
+    mine = usage_totals(path, before=time_before(path, off))
     ver = _version(path)
     out = {}
     for model in want:
-        u, got = usage.get(model), mine.get(model)
-        if not got or not u["costUSD"] or u["costUSD"] <= 0 or got[0] <= 0:
-            continue
-        if model.startswith("claude-sonnet-5-5") and (ver is None or ver <= _BAD_SONNET_READ):
-            continue
-        if u["tokens"] <= 0 or abs(got[1] - u["tokens"]) > SOURCE_TOLERANCE * u["tokens"]:
-            continue
-        out[model] = u["costUSD"] / got[0]
+        rate = _confirmed_rate(model, usage.get(model), mine.get(model), ver)
+        if rate is not None:
+            out[model] = rate
     return out, size, set(mine)
 
 
@@ -659,7 +707,7 @@ def _file_rates(store, max_files):
             for key, u in usage.items():
                 model = key.split("[")[0]
                 if (model in want and model not in rates and have.get(model, 0) == 0
-                        and (calls is None or model not in calls)
+                        and calls is not None and model not in calls
                         and not model.startswith("claude-sonnet-5-5")):   # version unknown: never trust its reads
                     rate = _entry_rate(model, u)
                     if rate is not None:
@@ -718,10 +766,12 @@ def session_cost(path):
     # Rate from this session's own record first, so its cache mix is matched.
     rates = {}
     if off:
-        mine = usage_by_model(path, before=when_written)
-        for model, u in (rec.get("modelUsage") or {}).items():
-            if mine.get(model) and u.get("costUSD"):
-                rates[model] = u["costUSD"] / mine[model]
+        mine = usage_totals(path, before=when_written)
+        ver = _version(path)
+        for model, u in _by_base(rec.get("modelUsage")).items():
+            rate = _confirmed_rate(model, u, mine.get(model), ver)
+            if rate is not None:
+                rates[model] = rate
     missing = set(after) - rates.keys()
     if missing:
         rates.update(model_rates(missing, path.parent.parent, skip=path))

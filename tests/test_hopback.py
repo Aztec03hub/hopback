@@ -336,15 +336,15 @@ def test_model_rates_values_and_selection_rules():
     T = 1_700_000_000
     older = _cost_session(proj, "older", T, {"m": _usage(2.0), "only-old": _usage(7.0)})
     newer = _cost_session(proj, "newer", T + 100, {"m": _usage(4.0), "zero": _usage(0.0)})
-    # The weights are in/out/cache-read/cache-write = 1 / 5 / 0.1 / 2 (the aggregate has no TTL split: 1h writes assumed).
+    # The weights are in/out/cache-read/cache-write = 1 / 5 / 0.1 / 1.25 (the aggregate fallback is for helper models, which write 5m cache).
     mixed = _cost_session(proj, "mixed", T - 100, {"w": {
         "inputTokens": 10, "outputTokens": 10, "cacheReadInputTokens": 100,
-        "cacheCreationInputTokens": 8, "costUSD": 86.0 * 3}})
+        "cacheCreationInputTokens": 8, "costUSD": 80.0 * 3}})
     claude._RATES.clear()
     near = lambda got, want: abs(got - want) < 1e-9
     r = claude.model_rates({"m", "only-old", "zero", "w", "absent"}, store)
     assert near(r["m"], 4.0), r                       # the newer file wins
-    assert near(r["only-old"], 7.0) and near(r["w"], 3.0), r   # weighted tokens 10+50+10+16 = 86
+    assert near(r["only-old"], 7.0) and near(r["w"], 3.0), r   # weighted tokens 10+50+10+10 = 80
     assert "zero" not in r and "absent" not in r, r   # costUSD 0 is no rate
     r = claude.model_rates({"m"}, store, skip=newer)
     assert near(r["m"], 2.0), r                       # skip: that file does not count
@@ -1694,7 +1694,8 @@ def test_session_cost_calibration_returns_its_own_price():
     def rec(i, ts, u):
         return {"type": "assistant", "timestamp": ts, "message": {"id": i, "model": "claude-opus-5-5", "usage": u}}
     cost_rec = {"type": "cost-state", "totalCostUSD": exact(first), "modelUsage": {"claude-opus-5-5": {
-        "costUSD": exact(first)}}}
+        "inputTokens": 100, "outputTokens": 50, "cacheReadInputTokens": 5000,
+        "cacheCreationInputTokens": 2000, "costUSD": exact(first)}}}
     with tempfile.TemporaryDirectory() as d:
         proj = Path(d) / "proj"
         proj.mkdir()
@@ -1733,6 +1734,140 @@ def test_model_rates_come_from_per_call_usage_and_skip_old_sonnet_reads():
         claude._RATES.clear()
     assert abs(r["claude-opus-5-5"] - 3e-6) < 1e-12, r      # derived per call, [1m] suffix folded
     assert "claude-sonnet-5-5" not in r, r                  # 2.1.295 or earlier: wrong recorded read price
+
+
+_COMPACT = {"separators": (",", ":")}
+
+
+def _src_store(d, sessions):
+    """A store of exited sessions. Each: (name, model, version, base price, record-token
+    scale, record key suffix, subagent bytes). One 1000-read / 100-1h-write call each."""
+    store = Path(d) / "projects"
+    proj = store / "p"
+    proj.mkdir(parents=True)
+    for i, (name, model, version, base, scale, suffix, sub) in enumerate(sessions):
+        w = 10 + 50 + 1000 * claude.read_mult(model) + 200
+        usage = {"input_tokens": 10, "output_tokens": 10, "cache_read_input_tokens": 1000,
+                 "cache_creation_input_tokens": 100,
+                 "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 100}}
+        rec = {"type": "assistant", "timestamp": "2026-10-09T00:00:01Z", "message": {
+            "id": "a", "model": model, "usage": usage}}
+        if version:
+            rec["version"] = version
+        cost = {"type": "cost-state", "totalCostUSD": base * w, "modelUsage": {model + suffix: {
+            "inputTokens": 10, "outputTokens": 10, "cacheReadInputTokens": 1000 * scale,
+            "cacheCreationInputTokens": 100, "costUSD": base * w}}}
+        f = proj / (name + ".jsonl")
+        f.write_text("\n".join(json.dumps(r, **_COMPACT) for r in (rec, cost)) + "\n")
+        os.utime(f, (1000 + i, 1000 + i))                    # later in the list = newer
+        if sub:
+            (proj / name / "subagents").mkdir(parents=True)
+            (proj / name / "subagents" / "x.jsonl").write_text("x" * sub)
+    return store
+
+
+def _rates(sessions, **patch):
+    with tempfile.TemporaryDirectory() as d:
+        store = _src_store(d, sessions)
+        claude._RATES.clear()
+        with mock.patch.multiple(claude, **patch) if patch else contextlib.nullcontext():
+            r = claude.model_rates({"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"}, store)
+        claude._RATES.clear()
+    return r
+
+
+def test_rate_source_guards():
+    O, S = "claude-opus-5-5", "claude-sonnet-5-5"
+    ok = lambda r, m, b: abs(r.get(m, -1) - b) < 1e-12
+    assert ok(_rates([("a", O, "2.1.300", 3e-6, 1.03, "", 0)]), O, 3e-6)           # 3% off: accepted
+    assert O not in _rates([("a", O, "2.1.300", 3e-6, 1.10, "", 0)])               # 10% off: rejected
+    assert ok(_rates([("a", S, "2.1.296", 3e-6, 1, "", 0)]), S, 3e-6)              # fixed version
+    assert S not in _rates([("a", S, "2.1.295", 3e-6, 1, "", 0)])
+    assert S not in _rates([("a", S, None, 3e-6, 1, "", 0)])                       # unknown version
+    assert ok(_rates([("a", O, None, 3e-6, 1, "[1m]", 0)]), O, 3e-6)               # unknown version is fine off sonnet
+    # size cap and budget: skipped, and NOT replaced by the unverified aggregate (L1)
+    assert O not in _rates([("a", O, "2.1.300", 3e-6, 1, "", 0)], SOURCE_MAX_BYTES=30)
+    assert O not in _rates([("a", O, "2.1.300", 3e-6, 1, "", 0)], SOURCE_BUDGET=30)
+    assert O not in _rates([("a", O, "2.1.300", 3e-6, 1, "", 5000)], SOURCE_MAX_BYTES=4000)   # subagent bytes count
+    assert ok(_rates([("a", O, "2.1.300", 3e-6, 1, "", 5000)], SOURCE_MAX_BYTES=10**6), O, 3e-6)
+    # at most SOURCE_PER_MODEL sources are read per model
+    seen = []
+    real = claude.usage_totals
+    def counting(*a, **k):
+        seen.append(1)
+        return real(*a, **k)
+    _rates([(n, O, "2.1.300", 3e-6, 1, "", 0) for n in "abcd"], usage_totals=counting)
+    assert len(seen) == claude.SOURCE_PER_MODEL == 2, len(seen)
+
+
+def test_fallback_rate_only_for_models_without_calls():
+    # No assistant calls for the model in a readable transcript: the aggregate is the fallback,
+    # with cache writes at 1.25x (helper models write 5m cache), never for sonnet-5-5.
+    with tempfile.TemporaryDirectory() as d:
+        store = Path(d) / "projects"
+        (store / "p").mkdir(parents=True)
+        usage = {m: {"inputTokens": 10, "outputTokens": 10, "cacheReadInputTokens": 100,
+                     "cacheCreationInputTokens": 8, "costUSD": 1.0}
+                 for m in ("claude-haiku-5-5", "claude-sonnet-5-5")}
+        (store / "p" / "h.jsonl").write_text(json.dumps(
+            {"type": "cost-state", "totalCostUSD": 2.0, "modelUsage": usage}, **_COMPACT) + "\n")
+        claude._RATES.clear()
+        r = claude.model_rates({"claude-haiku-5-5", "claude-sonnet-5-5"}, store)
+        claude._RATES.clear()
+    assert abs(r["claude-haiku-5-5"] - 1.0 / (10 + 50 + 100 * .1 + 8 * 1.25)) < 1e-12, r
+    assert "claude-sonnet-5-5" not in r, r
+
+
+def test_usage_totals_survive_malformed_lines():
+    good = {"type": "assistant", "timestamp": "2026-10-09T00:00:01Z", "message": {
+        "id": "g", "model": "m", "usage": {"input_tokens": 7}}}
+    def call(usage=None, message=None):
+        return {"type": "assistant", "timestamp": "t", "message": message if message is not None else {
+            "id": "b", "model": "m", "usage": usage}}
+    bad = [json.dumps(call(usage="oops")), json.dumps(call(usage={"input_tokens": "9"})),
+           json.dumps(call(usage={"iterations": 5})),
+           json.dumps(call(usage={"input_tokens": 0, "iterations": [{"cache_creation": "x"}, 3]})),
+           json.dumps(call(usage={"input_tokens": 1, "cache_creation": "x"})),
+           json.dumps(call(message="a string")), json.dumps([1, 2, "usage assistant"]),
+           '{"type":"assistant","usage":' + "[" * 100000 + '"usage"}',
+           json.dumps({"type": "assistant", "timestamp": 5, "message": {"id": 3, "model": "m", "usage": {"input_tokens": 1}}})]
+    with tempfile.TemporaryDirectory() as d:
+        for i, line in enumerate(bad):
+            f = Path(d) / ("s%d.jsonl" % i)
+            f.write_text(line + "\n" + json.dumps(good) + "\n")
+            assert claude.usage_totals(f) == {"m": (7, 7)}, (i, line[:60])
+        # a call whose only usage is bad iterations counts as nothing, not as an error
+        assert claude.weighted_tokens({"iterations": [{"input_tokens": "x"}]}) == 0
+
+
+def test_own_rate_folds_1m_names_and_applies_the_gates():
+    def run(key, version, scale=1):
+        with tempfile.TemporaryDirectory() as d:
+            store = _src_store(d, [("a", "claude-sonnet-5-5", version, 2e-6, scale, key, 0)])
+            f = store / "p" / "a.jsonl"
+            tail = {"type": "assistant", "timestamp": "2026-10-09T00:00:09Z", "message": {
+                "id": "b", "model": "claude-sonnet-5-5", "usage": {"input_tokens": 1000}}}
+            with f.open("a") as fh:
+                fh.write(json.dumps(tail, **_COMPACT) + "\n")
+            claude._RATES.clear()
+            cost, exact, _, _ = claude.session_cost(f)
+            claude._RATES.clear()
+        return cost, exact
+    base = 2e-6 * (10 + 50 + 1000 * .05 + 200)
+    c, e = run("[1m]", "2.1.300")
+    assert not e and abs(c - (base + 1000 * 2e-6)) < 1e-12, c       # [1m] key folded
+    assert abs(run("", "2.1.295")[0] - base) < 1e-12              # old sonnet: own rate refused, tail unpriced
+    assert abs(run("", "2.1.300", scale=1.5)[0] - base) < 1e-12                   # tokens off by >5%: not calibrated
+
+
+def test_version_is_the_first_records_field():
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "v.jsonl"
+        f.write_text(json.dumps({"type": "user", "message": {"content": '"version":"9.9.9"'}}) + "\n"
+                     + json.dumps({"type": "x", "version": "2.1.296"}) + "\n")
+        assert claude._version(f) == (2, 1, 296)
+        f.write_text("not json \"version\":\"1.2.3\"\n")
+        assert claude._version(f) is None
 
 
 def test_exec_leaves_no_leaked_semaphores():
