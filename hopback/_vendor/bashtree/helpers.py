@@ -135,7 +135,9 @@ class Unwrapped:
     #                       "untrusted-path" (`words` starts with `./sudo` or the like),
     #                       "too-deep" (over MAX_WRAPPERS),
     #                       "nonliteral-assignment" (a Word like "${a}_X=1": maybe an assignment),
-    #                       "nonliteral-program" (the program word is `$S`, a glob, ...: `words` from it on)
+    #                       "nonliteral-program" (the program word is `$S`, a glob, ...: `words` from it on),
+    #                       "nonliteral-operand" (a wrapper option value or the timeout duration is `$T`:
+    #                       `words` from that wrapper on)
     options: tuple = ()   # per wrapper, its options as (name, value) pairs:
     #                       `time -o f` writes f
 
@@ -207,6 +209,11 @@ def unwrap(words):
             return stop("query")
         if names & WRAPPER_EDIT.get(name, set()):
             return stop("edit")
+        used = [lits[k] and not _NONLIT.search(words[k]) for k in range(1, len(words) - len(rest))]
+        if name == "timeout" and rest:
+            used.append(lits[len(lits) - len(rest)] and not _NONLIT.search(rest[0]))
+        if not all(used) and not (name == "env" and names & {"-S", "--split-string"}):                             # word splitting could shift which program runs
+            return Unwrapped(tuple(words), tuple(peeled), "nonliteral-operand", tuple(options))
         j = 0
         if name == "env":
             split = [v for o, v in opts if o in ("-S", "--split-string")]
@@ -328,6 +335,7 @@ _NESTERS = frozenset(SHELLS) | frozenset(C_TAKES_TEXT) | {"su", "runuser", "eval
 
 # Programs that run their operands (or a shell) but have no table here: "unknown", never "nothing".
 LAUNCHERS = frozenset("doas pkexec chroot taskset chrt numactl unshare nsenter setpriv strace ltrace fakeroot "
+                      "unbuffer sshpass gosu su-exec bwrap faketime chpst runas "
                       "chronic ifne flock watch parallel xvfb-run systemd-run ssh docker kubectl xterm".split())
 
 
@@ -342,7 +350,7 @@ class GitArgs:
     subcommand: str | None   # None: none given, or ok is False
     rest: tuple          # the subcommand's own arguments (unread words if not ok)
     ok: bool             # False: a global option this table doesn't list (or a missing value),
-    #                      a `-c`/`--config-env` key that runs a command, or a non-literal subcommand
+    #                      any `-c`/`--config-env` key off a short inert allowlist, a `<helper>::` word, or a non-literal subcommand
     unknown: str | None = None   # that option or word, as written; None when ok
     runs_command: bool = False   # True (with ok False) when a `-c`/`--config-env` key can run a command
     #                              (`alias.x=!cmd`, core.pager, core.fsmonitor ...). `subcommand` is the
@@ -355,22 +363,31 @@ _GIT_FLAGS = frozenset("""-p --paginate -P --no-pager --no-replace-objects --no-
 _GIT_VALUES = frozenset("-C -c --git-dir --work-tree --namespace --super-prefix --config-env --attr-source".split())
 
 
-# Config keys (lower-cased, subsection dropped as `*`) whose value git runs as a command or a program.
-_GIT_CMD_KEYS = frozenset("""core.fsmonitor core.sshcommand core.pager core.editor core.hookspath core.askpass
-    core.gitproxy credential.helper diff.external diff.*.textconv diff.*.command filter.*.clean filter.*.smudge
-    filter.*.process gpg.program gpg.*.program sequence.editor sendemail.smtpserver uploadpack.packobjectshook
-    merge.*.driver mergetool.*.cmd difftool.*.cmd man.*.cmd browser.*.cmd trailer.*.cmd web.browser
-    include.path includeif.*.path url.*.insteadof url.*.pushinsteadof""".split())
+# INVERTED allowlist (r11b): a `-c`/`--config-env` key is unsafe unless it is listed here, because
+# a denylist of command-running keys always lags git (trailer.*.command, remote.*.uploadpack,
+# core.alternateRefsCommand, *.path, ext:: urls ...). Lower-cased; a trailing `.` entry is a whole
+# section. Only keys that never run a command or load a path.
+_GIT_INERT = frozenset("""
+    user.name user.email user.useconfigonly
+    color. advice. status.
+    core.quotepath core.autocrlf core.filemode core.whitespace core.abbrev core.ignorecase core.safecrlf core.eol
+    push.default push.followtags
+    init.defaultbranch pull.rebase pull.ff merge.ff
+    log.date log.decorate log.abbrevcommit
+    diff.algorithm diff.renames diff.context
+    branch.sort tag.sort fetch.prune""".split())
 
 
 def _git_cmd_key(key, value):
+    """True unless `key` is on the inert allowlist. `alias.*` is not listed, so it is unsafe: it renames the subcommand."""
     parts = key.lower().split(".")
     if len(parts) < 2:
-        return False
-    k = parts[0] + "." + parts[-1] if len(parts) == 2 else parts[0] + ".*." + parts[-1]
-    if parts[0] == "pager" or k in _GIT_CMD_KEYS or (parts[0] == "credential" and parts[-1] == "helper"):
         return True
-    return parts[0] == "alias" and (value is None or value.startswith("!") or _nonlit(value))
+    k = parts[0] + "." + parts[-1]
+    return not (len(parts) == 2 and (k in _GIT_INERT or parts[0] + "." in _GIT_INERT))
+
+
+_GIT_TRANSPORT = re.compile(r"(?:^|=)[A-Za-z0-9+.-]+::")    # `ext::sh -c x`, `<helper>::addr`
 
 
 def git_args(words):
@@ -407,6 +424,9 @@ def git_args(words):
         elif _nonlit(a, lits[i]):
             return GitArgs(tuple(opts), None, tuple(args[i:]), False, a)
         else:
+            bad = next((w for w in args[i + 1:] if _GIT_TRANSPORT.search(w)), None)
+            if bad is not None:                          # a transport helper url runs a program
+                return GitArgs(tuple(opts), None, tuple(args[i:]), False, bad, True)
             return GitArgs(tuple(opts), a, tuple(args[i + 1:]), True)
         i += 1
     return GitArgs(tuple(opts), None, (), True)

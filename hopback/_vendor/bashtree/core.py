@@ -380,6 +380,28 @@ def _redirect(node, src):
     return _redirect_plain(node, src)
 
 
+_MULTIROW = frozenset(("string", "raw_string", "ansi_c_string", "translated_string", "command_substitution",
+                       "process_substitution", "expansion", "arithmetic_expansion", "word", "concatenation"))
+
+
+def _opener_spans(node, src, after):
+    """True when a word, string or substitution that begins after a heredoc opener
+    (ending at byte `after`) runs across the newline that ends the opener line:
+    bash then reads the body from further on, so the tree's body is not it."""
+    nl = src.find(b"\n", after)
+    if nl < 0:
+        return False
+    while node.parent is not None:
+        node = node.parent
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.type in _MULTIROW and n.start_byte >= after:
+            return True
+        stack.extend(c for c in n.children if c.start_byte <= nl < c.end_byte)
+    return False
+
+
 def _redirect_plain(node, src):
     span = (node.start_byte, node.end_byte)
     if node.type == "heredoc_redirect":
@@ -392,7 +414,7 @@ def _redirect_plain(node, src):
         fd = next((c for c in node.children if c.type == "file_descriptor"), None)
         hb = next((c for c in node.children if c.type == "heredoc_body"), None)
         body = _heredoc_text(src[hb.start_byte:hb.end_byte] if hb else b"", op == "<<-", quoted)
-        if start and hb and b"\n" in src[start.end_byte:hb.start_byte].rstrip(b"\n"):
+        if start and _opener_spans(node, src, start.end_byte):
             body = None           # the opener line spans lines (a quote or `$(`): the body is not established
         return Redirect(op, _raw(fd, src) if fd else None, target, quoted, span, (), body)
     fd_node = node.child_by_field_name("descriptor")
@@ -1081,9 +1103,6 @@ def _heredoc_cut(src):
             body = _heredoc_text(src[start:cur], dash, quoted)
             if body is None:
                 return FALLBACK_REFUSED
-            line1 = src[:nl][src.rfind(b"\n", 0, g.start()) + 1:]
-            if line1.count(b"'") % 2 or line1.count(b'"') % 2 or line1.count(b"$(") > line1.count(b")"):
-                body = None           # the opener line goes on past this newline inside a quote or `$(`: no body established
             out[start:end] = re.sub(rb"[^\n]", b" ", src[start:end])
             o = g.start()
             out[o:o + 2 + dash] = b"<" + b" " * (1 + dash)
@@ -1115,6 +1134,8 @@ def _parse_bytes(src):
             if not t2.root_node.has_error:
                 tree, src = t2, _Src(s2)
                 src.heredocs, src.used = cut[1], set()
+                if any(_opener_spans(t2.root_node, s2, h[2]) for h in cut[1].values()):
+                    return Result(SYNTAX_ERROR, reason=FALLBACK_REFUSED)   # a quote or `$(` spans the opener line: the blanked text is not the word
     if tree.root_node.has_error:
         return Result(SYNTAX_ERROR, reason="tree-sitter-bash reports a syntax error")
     walked = _walk(tree.root_node, src)
