@@ -397,7 +397,8 @@ def _opener_spans(node, src, after):
     stack = [node]
     while stack:
         n = stack.pop()
-        if n.type in _MULTIROW and n.start_byte >= after:
+        if n.start_byte >= after and (n.type in _MULTIROW or n.type == "array"
+                                      or (n.type == "compound_statement" and src[n.start_byte:n.start_byte + 2] == b"((")):
             return True
         stack.extend(c for c in n.children if c.start_byte <= nl < c.end_byte)
     return False
@@ -756,6 +757,57 @@ _QUOTED_MARK = re.compile(rb"(?<!\\)(?:\\\\)*(?:`|\$\()")
 _OPAQUE = {"string", "string_content", "raw_string", "ansi_c_string", "comment", "heredoc_body",
            "heredoc_content", "translated_string"}
 _CONTROL = (b"\r", b"\x0b", b"\x0c", "﻿".encode())   # bash keeps these in a word
+
+
+_NL_SPANNERS = {"array", "arithmetic_expansion", "parenthesized_expression", "binary_expression",
+                "unary_expression", "test_command"}
+_DISPUTED = "heredoc body placement disputed"
+
+
+def _placement(root, src):
+    """Why bash would put a heredoc body somewhere other than the tree did; None
+    if they agree. The grammar hangs the body of `A <<E && {` on the END of what
+    follows, so a later line equal to the delimiter can be taken for the end and
+    a command in between is lost. Bash reads the body from the first line break
+    after the opener (after the previous body, for a second opener on the line)
+    and ends it at the first line equal to the delimiter. A line break inside an
+    array, `((..))`, `[[ ]]` or after a backslash is not that line break."""
+    opens, stack = [], [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "heredoc_redirect":
+            st = next((c for c in n.children if c.type == "heredoc_start"), None)
+            en = next((c for c in n.children if c.type == "heredoc_end"), None)
+            if st is not None:
+                opens.append((st, en, any(c.type == "<<-" for c in n.children)))
+        stack.extend(n.children)
+    cursor = 0
+    for st, en, dash in sorted(opens, key=lambda o: o[0].start_byte):
+        nl = src.find(b"\n", st.end_byte)
+        if nl < 0 or en is None:
+            return _DISPUTED
+        head = src[:nl]
+        if (len(head) - len(head.rstrip(b"\\"))) & 1:
+            return _DISPUTED
+        at = root.descendant_for_byte_range(nl, nl + 1)
+        while at is not None:
+            if at.type in _NL_SPANNERS:
+                return _DISPUTED
+            at = at.parent
+        pos = max(nl + 1, cursor)
+        delim = src[en.start_byte:en.end_byte]
+        while True:
+            e = src.find(b"\n", pos)
+            line = src[pos:e if e >= 0 else len(src)]
+            if (line.lstrip(b"\t") if dash else line) == delim:
+                break
+            if e < 0:
+                return _DISPUTED
+            pos = e + 1
+        if pos + len(line) - len(delim) != en.start_byte:
+            return _DISPUTED
+        cursor = e + 1 if e >= 0 else len(src)
+    return None
 
 
 def _unparsed(root, src):
@@ -1146,7 +1198,7 @@ def _parse_bytes(src):
         return Result(SYNTAX_ERROR, reason=FALLBACK_REFUSED)
     if walked is None:
         return Result(TOO_BIG, reason=f"nested over {MAX_DEPTH} deep, or over {MAX_COMMANDS} commands")
-    why = _unparsed(tree.root_node, src)
+    why = _unparsed(tree.root_node, src) or _placement(tree.root_node, src)
     if why:
         return Result(SYNTAX_ERROR, reason=why)
     commands = tuple(walked)
