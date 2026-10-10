@@ -1707,6 +1707,34 @@ def test_session_cost_calibration_returns_its_own_price():
     assert abs(got - (exact(first) + exact(second))) < 1e-9, (got, exact(first) + exact(second))
 
 
+def test_model_rates_come_from_per_call_usage_and_skip_old_sonnet_reads():
+    def usage(r, w):
+        return {"input_tokens": 10, "output_tokens": 10, "cache_read_input_tokens": r,
+                "cache_creation_input_tokens": w,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": w}}
+    def session(proj, name, model, version, base, key=None):
+        u = usage(1000, 100)
+        w = 10 + 50 + 1000 * claude.read_mult(model) + 200          # 1h writes at 2x
+        n = 10 + 10 + 1000 + 100
+        recs = [{"type": "assistant", "version": version, "timestamp": "2026-10-09T00:00:01Z",
+                 "message": {"id": "a", "model": model, "usage": u}},
+                {"type": "cost-state", "totalCostUSD": base * w, "modelUsage": {key or model: {
+                    "inputTokens": 10, "outputTokens": 10, "cacheReadInputTokens": 1000,
+                    "cacheCreationInputTokens": 100, "costUSD": base * w}}}]
+        (proj / (name + ".jsonl")).write_text("\n".join(json.dumps(r, separators=(",", ":")) for r in recs) + "\n")
+    with tempfile.TemporaryDirectory() as d:
+        store = Path(d) / "projects"
+        proj = store / "p"
+        proj.mkdir(parents=True)
+        session(proj, "o", "claude-opus-5-5", "2.1.290", 3e-6, key="claude-opus-5-5[1m]")
+        session(proj, "s_old", "claude-sonnet-5-5", "2.1.295", 9e-6)
+        claude._RATES.clear()
+        r = claude.model_rates({"claude-opus-5-5", "claude-sonnet-5-5"}, store)
+        claude._RATES.clear()
+    assert abs(r["claude-opus-5-5"] - 3e-6) < 1e-12, r      # derived per call, [1m] suffix folded
+    assert "claude-sonnet-5-5" not in r, r                  # 2.1.295 or earlier: wrong recorded read price
+
+
 def test_exec_leaves_no_leaked_semaphores():
     # The preview pool, torn down as on_unmount does, then exec into the agent:
     # without the cleanup the resource tracker warns when the agent exits.
