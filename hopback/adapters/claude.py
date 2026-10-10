@@ -407,7 +407,7 @@ def _counts(x):
         w5m = _num(cc["ephemeral_5m_input_tokens"])
     else:
         w5m = None if v[3] is None or w1h is None else v[3] - w1h
-    if w1h is None or w5m is None or None in v:
+    if w1h is None or w5m is None or w5m < 0 or None in v:
         return None
     return (*v, w5m, w1h)
 
@@ -523,8 +523,9 @@ STOP = threading.Event()          # set when the app closes: scans stop at the n
 
 
 def _num(v):
-    """`v` if it is a finite number, else None: a cost record is data from disk."""
-    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    """`v` if it is a number in [0, 2**63), else None (NaN, inf, negative, a huge
+    int, bool, str): a cost or usage record is data from disk."""
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 2 ** 63
     return v if ok else None
 
 
@@ -574,7 +575,7 @@ def _version(path):
         v = rec.get("version") if isinstance(rec, dict) else None
         if isinstance(v, str):
             try:
-                return tuple(int(x) for x in v.split("."))
+                return tuple(int(x) for x in v.split("-")[0].split("."))
             except ValueError:
                 return None
     return None
@@ -757,7 +758,7 @@ def session_cost(path):
     reply, priced at rates measured from real cost records.
     """
     off, rec = last_line_with(path, COST_MARK)
-    rec = rec or {}
+    rec = rec if isinstance(rec, dict) else {}
     cost = rec.get("totalCostUSD") or 0.0
     when_written = time_before(path, off) if off else None
     after = usage_by_model(path, after=when_written)

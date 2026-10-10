@@ -1828,6 +1828,10 @@ def test_usage_totals_survive_malformed_lines():
            json.dumps(call(usage={"iterations": 5})),
            json.dumps(call(usage={"input_tokens": 0, "iterations": [{"cache_creation": "x"}, 3]})),
            json.dumps(call(usage={"input_tokens": 1, "cache_creation": "x"})),
+           '{"type":"assistant","timestamp":"t","message":{"id":"b","model":"m","usage":{"input_tokens":1' + "0" * 400 + '}}}',
+           json.dumps(call(usage={"input_tokens": -1000000})),
+           json.dumps(call(usage={"cache_creation_input_tokens": 10,
+                                  "cache_creation": {"ephemeral_1h_input_tokens": 1000}})),
            json.dumps(call(message="a string")), json.dumps([1, 2, "usage assistant"]),
            '{"type":"assistant","usage":' + "[" * 100000 + '"usage"}',
            json.dumps({"type": "assistant", "timestamp": 5, "message": {"id": 3, "model": "m", "usage": {"input_tokens": 1}}})]
@@ -1866,8 +1870,68 @@ def test_version_is_the_first_records_field():
         f.write_text(json.dumps({"type": "user", "message": {"content": '"version":"9.9.9"'}}) + "\n"
                      + json.dumps({"type": "x", "version": "2.1.296"}) + "\n")
         assert claude._version(f) == (2, 1, 296)
+        f.write_text(json.dumps({"version": "2.1.296-beta"}) + "\n")
+        assert claude._version(f) == (2, 1, 296)
         f.write_text("not json \"version\":\"1.2.3\"\n")
         assert claude._version(f) is None
+
+
+def test_confirmed_rate_refuses_nonpositive_inputs():
+    ok = {"costUSD": 2.0, "tokens": 100}
+    assert claude._confirmed_rate("m", ok, (4.0, 100), None) == 0.5
+    for u in ({"costUSD": 0, "tokens": 100}, {"costUSD": -2.0, "tokens": 100}, {"costUSD": 2.0, "tokens": 0}, None):
+        assert claude._confirmed_rate("m", u, (4.0, 100), None) is None, u
+    assert claude._confirmed_rate("m", ok, (0, 100), None) is None
+    assert claude._confirmed_rate("m", ok, (-4.0, 100), None) is None
+
+
+def test_session_cost_survives_a_cost_record_that_is_not_an_object():
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "s.jsonl"
+        f.write_text('[{"type":"cost-state"}]\n')
+        assert claude.session_cost(f)[0] in (0, 0.0, None)
+
+
+def test_rate_source_size_budget_and_cache_rules():
+    O = "claude-opus-5-5"
+    assert (claude.SOURCE_MAX_BYTES, claude.SOURCE_BUDGET) == (30 * 1024 * 1024, 400 * 1024 * 1024)
+    # a sparse subagent file just over 30 MB: skipped; the cap raised 100x: read
+    with tempfile.TemporaryDirectory() as d:
+        store = _src_store(d, [("a", O, "2.1.300", 3e-6, 1, "", 1)])
+        sub = store / "p" / "a" / "subagents" / "x.jsonl"
+        with sub.open("r+b") as fh:
+            fh.truncate(30 * 1024 * 1024 + 1)
+        claude._RATES.clear()
+        assert O not in claude.model_rates({O}, store)
+        claude._RATES.clear()
+        with mock.patch.object(claude, "SOURCE_MAX_BYTES", 100 * 30 * 1024 * 1024):
+            assert O in claude.model_rates({O}, store)
+        claude._RATES.clear()
+    # a budget that fits one session only: the second is not read
+    seen = []
+    real = claude.usage_totals
+    def counting(*a, **k):
+        seen.append(1)
+        return real(*a, **k)
+    two = [(n, O, "2.1.300", 3e-6, 1, "", 0) for n in "ab"]
+    with tempfile.TemporaryDirectory() as d:
+        store = _src_store(d, two)
+        size = (store / "p" / "a.jsonl").stat().st_size
+        for budget, want in ((size + 10, 1), (100 * size, 2)):
+            seen.clear()
+            claude._RATES.clear()
+            with mock.patch.object(claude, "SOURCE_BUDGET", budget), mock.patch.object(claude, "usage_totals", counting):
+                claude.model_rates({O}, store)
+            assert len(seen) == want, (budget, len(seen))
+        # a transient read error is returned but never cached
+        claude._RATES.clear()
+        def eio(path, marker, chunk=0, errors=None):
+            errors.append(OSError(5, "EIO"))
+            return None, None
+        with mock.patch.object(claude, "last_line_with", eio):
+            claude.model_rates({O}, store)
+        assert store not in claude._RATES
+        claude._RATES.clear()
 
 
 def test_exec_leaves_no_leaked_semaphores():
