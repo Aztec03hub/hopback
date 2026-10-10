@@ -133,7 +133,9 @@ class Unwrapped:
     #                       "query" (`command -v x`), "edit" (`sudo -e f`),
     #                       "unsized-option" (an option we can't size),
     #                       "untrusted-path" (`words` starts with `./sudo` or the like),
-    #                       "too-deep" (over MAX_WRAPPERS)
+    #                       "too-deep" (over MAX_WRAPPERS),
+    #                       "nonliteral-assignment" (a Word like "${a}_X=1": maybe an assignment),
+    #                       "nonliteral-program" (the program word is `$S`, a glob, ...: `words` from it on)
     options: tuple = ()   # per wrapper, its options as (name, value) pairs:
     #                       `time -o f` writes f
 
@@ -148,25 +150,53 @@ def _trusted(word):
     return ".." not in word.split("/") and d in SYSTEM_DIRS
 
 
+_NONLIT = re.compile(r"[$`*?{]")      # a plain string cannot say it was quoted; `[` is the test builtin
+
+
+def _nonlit(text, literal=True):
+    return not literal or bool(_NONLIT.search(text))
+
+
 def _wrapper(word):
     name = os.path.basename(word)
     return name if name in WRAPPERS and _trusted(word) else None
 
 
 def unwrap(words):
-    """Peel VAR=value prefixes and wrappers off a command's words."""
-    words = list(words)
+    """Peel VAR=value prefixes and wrappers off a command's words. Words may be
+    strings or Word objects (`.text`, `.literal`); a non-literal word that looks
+    like an assignment (`"${a}_X=1"`) stops with "nonliteral-assignment"."""
+    lits = [getattr(w, "literal", True) for w in words]
+    words = [getattr(w, "text", w) for w in words]
+    peeled, options = [], []
+    again = False                                        # env -S: the pieces re-enter the loop as the same env
+
+    def bad(k):                                          # words[k] might be an assignment we can't read
+        return not lits[len(lits) - len(words) + k] and "=" in words[k] and not _ASSIGN.match(words[k])
+
+    def nonlit(k):
+        return Unwrapped(tuple(words[k:]), tuple(peeled), "nonliteral-assignment", tuple(options))
     i = 0
-    while i < len(words) and _ASSIGN.match(words[i]):
+    while i < len(words) and (_ASSIGN.match(words[i]) or bad(i)):
+        if bad(i):
+            return nonlit(i)
         i += 1
-    words, peeled, options = words[i:], [], []
+    words = words[i:]
+    lits = lits[i:]
     while words and (name := _wrapper(words[0])):
         if len(peeled) >= MAX_WRAPPERS:
             return Unwrapped(tuple(words), tuple(peeled), "too-deep", tuple(options))
-        peeled.append(name)
         opts, rest, ok = getopt(words[1:], WRAPPERS[name], until={"-S", "--split-string"} if name == "env" else ())
-        options.append(tuple(opts))
+        if again:
+            options[-1] += tuple(opts)
+            again = False
+        else:
+            peeled.append(name)
+            options.append(tuple(opts))
         names = {o for o, _ in opts}
+
+        def bad2(r, k):
+            return not lits[len(lits) - len(r) + k] and "=" in r[k] and not _ASSIGN.match(r[k])
 
         def stop(why, rest=rest):
             return Unwrapped(tuple(rest), tuple(peeled), why, tuple(options))
@@ -193,16 +223,24 @@ def unwrap(words):
                 except ValueError:
                     return stop("unsized-option")
                 words = [words[0]] + pieces + rest
+                lits = [True] * (1 + len(pieces)) + lits[len(lits) - len(rest):]
+                again = True
                 continue
             if rest[:1] == ["-"]:
                 j = 1                                    # a lone `-` is -i
             while j < len(rest) and "=" in rest[j]:
+                if bad2(rest, j):
+                    return Unwrapped(tuple(rest[j:]), tuple(peeled), "nonliteral-assignment", tuple(options))
                 j += 1                                   # env A=1 B=2 cmd: any word with =
         elif name in ("time", "!", "coproc"):            # keywords: `time X=1 cmd` runs cmd with X set
-            while j < len(rest) and _ASSIGN.match(rest[j]):
+            while j < len(rest) and (_ASSIGN.match(rest[j]) or bad2(rest, j)):
+                if bad2(rest, j):
+                    return Unwrapped(tuple(rest[j:]), tuple(peeled), "nonliteral-assignment", tuple(options))
                 j += 1
         elif name == "sudo":
-            while j < len(rest) and _ASSIGN.match(rest[j]):
+            while j < len(rest) and (_ASSIGN.match(rest[j]) or bad2(rest, j)):
+                if bad2(rest, j):
+                    return Unwrapped(tuple(rest[j:]), tuple(peeled), "nonliteral-assignment", tuple(options))
                 j += 1
             if names & {"-s", "-i", "--shell", "--login"} and not rest[j:]:
                 return stop("unsized-option")            # a shell that reads its commands from stdin
@@ -211,8 +249,11 @@ def unwrap(words):
         elif name == "timeout" and rest:
             j = 1                                        # the duration
         words = rest[j:]
+        lits = lits[len(lits) - len(words):] if words else []
     # `./sudo x`, `/usr/local/bin/env x`: a wrapper's name from a path we don't trust
     stopped = "untrusted-path" if words and os.path.basename(words[0]) in WRAPPERS else None
+    if words and _nonlit(words[0], lits[0]):
+        stopped = "nonliteral-program"
     return Unwrapped(tuple(words), tuple(peeled), stopped, tuple(options))
 
 
@@ -287,7 +328,7 @@ _NESTERS = frozenset(SHELLS) | frozenset(C_TAKES_TEXT) | {"su", "runuser", "eval
 
 # Programs that run their operands (or a shell) but have no table here: "unknown", never "nothing".
 LAUNCHERS = frozenset("doas pkexec chroot taskset chrt numactl unshare nsenter setpriv strace ltrace fakeroot "
-                      "flock watch parallel xvfb-run systemd-run ssh docker kubectl xterm".split())
+                      "chronic ifne flock watch parallel xvfb-run systemd-run ssh docker kubectl xterm".split())
 
 
 # Builtins that evaluate an operand as arithmetic or a subscript, running a substitution in it.
@@ -295,10 +336,96 @@ _SUBSCRIPTED = frozenset({"let", "read", "declare", "typeset", "local", "readonl
                           "printf", "test", "[", "mapfile", "readarray", "getopts"})
 
 
-def nested(words):
-    """What this (already unwrapped) command runs in turn. [] when nothing."""
+@dataclass(frozen=True)
+class GitArgs:
+    options: tuple       # global options as (name, value or None), in order
+    subcommand: str | None   # None: none given, or ok is False
+    rest: tuple          # the subcommand's own arguments (unread words if not ok)
+    ok: bool             # False: a global option this table doesn't list (or a missing value),
+    #                      a `-c`/`--config-env` key that runs a command, or a non-literal subcommand
+    unknown: str | None = None   # that option or word, as written; None when ok
+    runs_command: bool = False   # True (with ok False) when a `-c`/`--config-env` key can run a command
+    #                              (`alias.x=!cmd`, core.pager, core.fsmonitor ...). `subcommand` is the
+    #                              name as written, before alias resolution.
+
+
+_GIT_FLAGS = frozenset("""-p --paginate -P --no-pager --no-replace-objects --no-lazy-fetch --no-optional-locks
+    --no-advice --bare --literal-pathspecs --glob-pathspecs --noglob-pathspecs --icase-pathspecs -v --version
+    -h --help --html-path --man-path --info-path""".split())
+_GIT_VALUES = frozenset("-C -c --git-dir --work-tree --namespace --super-prefix --config-env --attr-source".split())
+
+
+# Config keys (lower-cased, subsection dropped as `*`) whose value git runs as a command or a program.
+_GIT_CMD_KEYS = frozenset("""core.fsmonitor core.sshcommand core.pager core.editor core.hookspath core.askpass
+    core.gitproxy credential.helper diff.external diff.*.textconv diff.*.command filter.*.clean filter.*.smudge
+    filter.*.process gpg.program gpg.*.program sequence.editor sendemail.smtpserver uploadpack.packobjectshook
+    merge.*.driver mergetool.*.cmd difftool.*.cmd man.*.cmd browser.*.cmd trailer.*.cmd web.browser
+    include.path includeif.*.path url.*.insteadof url.*.pushinsteadof""".split())
+
+
+def _git_cmd_key(key, value):
+    parts = key.lower().split(".")
+    if len(parts) < 2:
+        return False
+    k = parts[0] + "." + parts[-1] if len(parts) == 2 else parts[0] + ".*." + parts[-1]
+    if parts[0] == "pager" or k in _GIT_CMD_KEYS or (parts[0] == "credential" and parts[-1] == "helper"):
+        return True
+    return parts[0] == "alias" and (value is None or value.startswith("!") or _nonlit(value))
+
+
+def git_args(words):
+    """Split `git [global options] subcommand args` (words start with git; strings
+    or Word objects). Git reads its global options exactly: `-C path` and `-c name=val` are two
+    words, `-C/x`, `-ccore.x=1` and `-pP` are errors, long options are not
+    abbreviated; `--x=v` or `--x v` for the valued ones, `--exec-path[=v]` and
+    `--list-cmds=v` only attached. Anything else before the subcommand is ok False,
+    as is a non-literal word there, or a `-c`/`--config-env` key that runs a command
+    (runs_command True)."""
+    lits = [getattr(w, "literal", True) for w in words[1:]]
+    args, opts, i = [getattr(w, "text", w) for w in words[1:]], [], 0
+    while i < len(args):
+        a = args[i]
+        name, eq, val = a.partition("=") if a.startswith("--") else (a, "", "")
+        if a in _GIT_FLAGS:
+            opts.append((a, None))
+        elif a in _GIT_VALUES and i + 1 < len(args):
+            opts.append((a, args[i + 1]))
+            if a in ("-c", "--config-env"):
+                k, e, v = args[i + 1].partition("=")
+                if _git_cmd_key(k, v if e and a == "-c" else None) or _nonlit(k):
+                    return GitArgs(tuple(opts[:-1]), None, tuple(args[i:]), False, args[i + 1], True)
+            i += 1
+        elif eq and name in _GIT_VALUES:
+            opts.append((name, val))
+            if name == "--config-env":
+                if _git_cmd_key(val.partition("=")[0], None):                # the value is an env var name: unreadable
+                    return GitArgs(tuple(opts[:-1]), None, tuple(args[i:]), False, val, True)
+        elif a == "--exec-path" or (eq and name in ("--exec-path", "--list-cmds")):
+            opts.append((name, val if eq else None))
+        elif a.startswith("-"):
+            return GitArgs(tuple(opts), None, tuple(args[i:]), False, a)
+        elif _nonlit(a, lits[i]):
+            return GitArgs(tuple(opts), None, tuple(args[i:]), False, a)
+        else:
+            return GitArgs(tuple(opts), a, tuple(args[i + 1:]), True)
+        i += 1
+    return GitArgs(tuple(opts), None, (), True)
+
+
+def nested(words, unwrap_first=True):
+    """What this command runs in turn. [] when nothing. With `unwrap_first`
+    (default) sudo, env and the like are peeled first: `sudo bash -c x` gives
+    the bash -c text; a wrapper unwrap() stops at (query, edit, unsized option,
+    untrusted path, too deep) gives one `unknown` for it."""
+    if unwrap_first and words:
+        u = unwrap(words)
+        if u.stopped:
+            return [Nested((u.wrappers or (os.path.basename(words[0]),))[-1], "unknown", words=u.words)]
+        words = u.words
     if not words:
         return []
+    if _nonlit(words[0]):                                # `$S x`: runs whatever the expansion makes it
+        return [Nested(os.path.basename(words[0]), "unknown", words=tuple(words[1:]))]
     prog, args = os.path.basename(words[0]), list(words[1:])
     if prog in _NESTERS and not _trusted(words[0]):
         # `./bash` or `/tmp/tmux` may be anything: the same gate unwrap() puts
@@ -307,7 +434,7 @@ def nested(words):
     if prog == "trap":                                   # trap 'text' SIGNAL runs the text later
         ops = args[1:] if args[:1] == ["--"] else args
         return [Nested("trap", "text", text=ops[0])] if len(ops) > 1 and ops[0] not in ("-", "-l", "-p") else []
-    if prog in LAUNCHERS:
+    if prog in LAUNCHERS or prog in (".", "source"):    # `source <(cmd)`: cmd is found as a procsub; a file is unknown
         return [Nested(prog, "unknown", words=tuple(args))]
     if prog in _SUBSCRIPTED and any("[" in a and ("$(" in a or "`" in a) for a in args):
         return [Nested(prog, "unknown", words=tuple(args))]   # a[$(cmd)]: arithmetic expands it

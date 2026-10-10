@@ -51,7 +51,9 @@ def _runs_claude(tokens, depth, launch=None):
     if depth > 4:
         return False
     u = unwrap(tokens)
-    if u.stopped or not u.words:
+    # A variable-built path (`$HOME/.local/bin/claude`) is still the program; the
+    # name is literal, only the directory isn't.
+    if (u.stopped and u.stopped != "nonliteral-program") or not u.words:
         return False                   # a lookup, or a wrapper we can't see past
     prog, args = os.path.basename(u.words[0]), u.words[1:]
     if prog == "claude":
