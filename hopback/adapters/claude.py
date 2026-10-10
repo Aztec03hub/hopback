@@ -552,6 +552,8 @@ def _entry_rate(model, u):
 
 SOURCE_MAX_BYTES = 30 * 1024 * 1024      # a transcript larger than this is not read as a rate source
 SOURCE_BUDGET = 400 * 1024 * 1024        # total transcript bytes one store scan may read
+# A cost record can include tail calls missing from the transcript (up to the tolerance),
+# which biases a rate up by at most that much (5%).
 SOURCE_TOLERANCE = 0.05                  # per-call token sum must match the cost record this closely
 SOURCE_PER_MODEL = 2                     # sources kept per model (one spare for skip=)
 _BAD_SONNET_READ = (2, 1, 295)           # up to this Claude Code version, sonnet-5-5 cache reads were costed at 0.20 not 0.10
@@ -613,8 +615,10 @@ def _source_rates(path, off, rec, want, budget):
             size += f.stat().st_size
         except OSError:
             continue
-    if size > SOURCE_MAX_BYTES or size > budget:
-        return {}, 0, None
+    if size > SOURCE_MAX_BYTES:
+        return {}, 0, None            # too big: the caller may use the aggregate
+    if size > budget:
+        return {}, 0, set(want)       # over budget: skipped, and no aggregate fallback either
     usage = _by_base(rec.get("modelUsage"))
     mine = usage_totals(path, before=time_before(path, off))
     ver = _version(path)
@@ -708,7 +712,7 @@ def _file_rates(store, max_files):
             for key, u in usage.items():
                 model = key.split("[")[0]
                 if (model in want and model not in rates and have.get(model, 0) == 0
-                        and calls is not None and model not in calls
+                        and (calls is None or model not in calls)   # None: too big to read, aggregate only
                         and not model.startswith("claude-sonnet-5-5")):   # version unknown: never trust its reads
                     rate = _entry_rate(model, u)
                     if rate is not None:
@@ -759,11 +763,12 @@ def session_cost(path):
     """
     off, rec = last_line_with(path, COST_MARK)
     rec = rec if isinstance(rec, dict) else {}
-    cost = rec.get("totalCostUSD") or 0.0
+    cost = _num(rec.get("totalCostUSD")) or 0.0
+    added, removed = _num(rec.get("totalLinesAdded")), _num(rec.get("totalLinesRemoved"))
     when_written = time_before(path, off) if off else None
     after = usage_by_model(path, after=when_written)
     if not after:
-        return cost, True, rec.get("totalLinesAdded"), rec.get("totalLinesRemoved")
+        return cost, True, added, removed
     # Rate from this session's own record first, so its cache mix is matched.
     rates = {}
     if off:
@@ -778,9 +783,9 @@ def session_cost(path):
         rates.update(model_rates(missing, path.parent.parent, skip=path))
     priced = [m for m in after if m in rates]
     if not priced:
-        return (cost or None), not after, rec.get("totalLinesAdded"), rec.get("totalLinesRemoved")
+        return (cost or None), not after, added, removed
     cost += sum(after[m] * rates[m] for m in priced)
-    return cost, False, rec.get("totalLinesAdded"), rec.get("totalLinesRemoved")
+    return cost, False, added, removed
 
 
 def spawn_parents(root):

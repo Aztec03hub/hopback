@@ -1785,10 +1785,11 @@ def test_rate_source_guards():
     assert S not in _rates([("a", S, "2.1.295", 3e-6, 1, "", 0)])
     assert S not in _rates([("a", S, None, 3e-6, 1, "", 0)])                       # unknown version
     assert ok(_rates([("a", O, None, 3e-6, 1, "[1m]", 0)]), O, 3e-6)               # unknown version is fine off sonnet
-    # size cap and budget: skipped, and NOT replaced by the unverified aggregate (L1)
-    assert O not in _rates([("a", O, "2.1.300", 3e-6, 1, "", 0)], SOURCE_MAX_BYTES=30)
+    # size cap: aggregate fallback; budget: skipped, and NOT replaced by the unverified aggregate (L1)
+    assert O in _rates([("a", O, "2.1.300", 3e-6, 1, "", 0)], SOURCE_MAX_BYTES=30)       # too big: aggregate fallback
+    assert S not in _rates([("a", S, "2.1.300", 3e-6, 1, "", 0)], SOURCE_MAX_BYTES=30)   # never for sonnet-5-5
     assert O not in _rates([("a", O, "2.1.300", 3e-6, 1, "", 0)], SOURCE_BUDGET=30)
-    assert O not in _rates([("a", O, "2.1.300", 3e-6, 1, "", 5000)], SOURCE_MAX_BYTES=4000)   # subagent bytes count
+    assert not ok(_rates([("a", O, "2.1.300", 3e-6, 1, "", 5000)], SOURCE_MAX_BYTES=4000), O, 3e-6)   # subagent bytes count
     assert ok(_rates([("a", O, "2.1.300", 3e-6, 1, "", 5000)], SOURCE_MAX_BYTES=10**6), O, 3e-6)
     # at most SOURCE_PER_MODEL sources are read per model
     seen = []
@@ -1902,10 +1903,10 @@ def test_rate_source_size_budget_and_cache_rules():
         with sub.open("r+b") as fh:
             fh.truncate(30 * 1024 * 1024 + 1)
         claude._RATES.clear()
-        assert O not in claude.model_rates({O}, store)
+        too_big = claude.model_rates({O}, store)[O]
         claude._RATES.clear()
         with mock.patch.object(claude, "SOURCE_MAX_BYTES", 100 * 30 * 1024 * 1024):
-            assert O in claude.model_rates({O}, store)
+            assert claude.model_rates({O}, store)[O] != too_big   # per-call rate, not the aggregate
         claude._RATES.clear()
     # a budget that fits one session only: the second is not read
     seen = []
@@ -1932,6 +1933,32 @@ def test_rate_source_size_budget_and_cache_rules():
             claude.model_rates({O}, store)
         assert store not in claude._RATES
         claude._RATES.clear()
+
+
+def test_session_cost_validates_scalar_totals():
+    for bad in ('"5"', "NaN", "Infinity", "true", "-3"):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "s.jsonl"
+            f.write_text('{"type":"cost-state","totalCostUSD":%s,"totalLinesAdded":%s,"totalLinesRemoved":%s}\n'
+                         % (bad, bad, bad))
+            cost, _, added, removed = claude.session_cost(f)
+            assert cost in (0, 0.0, None) and added is None and removed is None, (bad, cost, added, removed)
+
+
+def test_too_big_transcript_falls_back_to_aggregate_except_sonnet_5_5():
+    with tempfile.TemporaryDirectory() as d:
+        store = Path(d) / "projects"
+        usage = {m: {"inputTokens": 10, "outputTokens": 10, "cacheReadInputTokens": 100,
+                     "cacheCreationInputTokens": 8, "costUSD": 1.0}
+                 for m in ("claude-opus-5", "claude-sonnet-5-5")}
+        (store / "p").mkdir(parents=True)
+        (store / "p" / "h.jsonl").write_text(json.dumps(
+            {"type": "cost-state", "totalCostUSD": 2.0, "modelUsage": usage}, **_COMPACT) + "\n")
+        claude._RATES.clear()
+        with mock.patch.object(claude, "SOURCE_MAX_BYTES", 1):
+            r = claude.model_rates({"claude-opus-5", "claude-sonnet-5-5"}, store)
+        claude._RATES.clear()
+    assert "claude-opus-5" in r and "claude-sonnet-5-5" not in r, r
 
 
 def test_exec_leaves_no_leaked_semaphores():
