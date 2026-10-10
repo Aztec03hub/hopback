@@ -7,6 +7,7 @@ Run either way:
 import asyncio
 import contextlib
 import io
+import json
 import os
 import shutil
 import sys
@@ -335,15 +336,15 @@ def test_model_rates_values_and_selection_rules():
     T = 1_700_000_000
     older = _cost_session(proj, "older", T, {"m": _usage(2.0), "only-old": _usage(7.0)})
     newer = _cost_session(proj, "newer", T + 100, {"m": _usage(4.0), "zero": _usage(0.0)})
-    # The weights are in/out/cache-read/cache-write = 1 / 5 / 0.1 / 1.25.
+    # The weights are in/out/cache-read/cache-write = 1 / 5 / 0.1 / 2 (the aggregate has no TTL split: 1h writes assumed).
     mixed = _cost_session(proj, "mixed", T - 100, {"w": {
         "inputTokens": 10, "outputTokens": 10, "cacheReadInputTokens": 100,
-        "cacheCreationInputTokens": 8, "costUSD": 80.0 * 3}})
+        "cacheCreationInputTokens": 8, "costUSD": 86.0 * 3}})
     claude._RATES.clear()
     near = lambda got, want: abs(got - want) < 1e-9
     r = claude.model_rates({"m", "only-old", "zero", "w", "absent"}, store)
     assert near(r["m"], 4.0), r                       # the newer file wins
-    assert near(r["only-old"], 7.0) and near(r["w"], 3.0), r   # weighted tokens 10+50+10+10 = 80
+    assert near(r["only-old"], 7.0) and near(r["w"], 3.0), r   # weighted tokens 10+50+10+16 = 86
     assert "zero" not in r and "absent" not in r, r   # costUSD 0 is no rate
     r = claude.model_rates({"m"}, store, skip=newer)
     assert near(r["m"], 2.0), r                       # skip: that file does not count
@@ -1646,6 +1647,64 @@ def test_hidden_and_review_views_list_the_right_rows():
         cli.review_rows = real
         cli.save_hidden(set())
         cli.save_review({})
+
+
+def test_cost_weights_per_model_and_ttl():
+    wt = claude.weighted_tokens
+    reads = {"claude-opus-5-5": .05, "claude-sonnet-5-5": .05, "claude-fable-5-1": .025,
+             "claude-mythos-5-1": .025, "claude-opus-4-8": .1, "unknown": .1, None: .1}
+    for model, mult in reads.items():
+        assert abs(wt({"cache_read_input_tokens": 1000}, model) - 1000 * mult) < 1e-9, model
+    assert wt({"output_tokens": 3}) == 15                     # output 5x, thinking included
+    five = {"cache_creation_input_tokens": 100, "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 0}}
+    hour = {"cache_creation_input_tokens": 100, "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 100}}
+    assert wt(five) == 125 and wt(hour) == 200
+    assert wt({"cache_creation_input_tokens": 100}) == 125     # no cache_creation object: 5m
+    # compaction call: zero top level, real numbers in iterations[]
+    comp = {"input_tokens": 0, "output_tokens": 0, "iterations": [
+        {"input_tokens": 10, "output_tokens": 2}, {"input_tokens": 5, "cache_read_input_tokens": 100}]}
+    assert wt(comp, "claude-sonnet-5-5") == 10 + 10 + 5 + 5
+    assert wt({"input_tokens": 7, "iterations": [{"input_tokens": 99}]}) == 7   # top level wins when present
+
+
+def test_usage_by_model_counts_iterations_and_model_reads():
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "s.jsonl"
+        recs = [{"type": "assistant", "timestamp": "2026-10-09T00:00:0%dZ" % i, "message": {
+            "id": "m%d" % i, "model": "claude-opus-5-5", "usage": u}}
+            for i, u in enumerate([{"cache_read_input_tokens": 200},
+                                   {"input_tokens": 0, "iterations": [{"output_tokens": 4}]}])]
+        f.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        got = claude.usage_by_model(f)
+        assert abs(got["claude-opus-5-5"] - 30.0) < 1e-9, got   # 200 * 0.05 reads + 4 * 5 iteration output
+
+
+def test_session_cost_calibration_returns_its_own_price():
+    # A session whose recorded cost is the exact price: the rest of the session
+    # (after the cost record) must be priced at that same rate, per call.
+    price = {"in": 4e-6, "w1h": 8e-6, "read": .2e-6, "out": 20e-6}
+    def usage(i, o, r, w):
+        return {"input_tokens": i, "output_tokens": o, "cache_read_input_tokens": r,
+                "cache_creation_input_tokens": w,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": w}}
+    def exact(u):
+        return (u["input_tokens"] * price["in"] + u["output_tokens"] * price["out"]
+                + u["cache_read_input_tokens"] * price["read"] + u["cache_creation_input_tokens"] * price["w1h"])
+    first, second = usage(100, 50, 5000, 2000), usage(30, 80, 9000, 500)
+    def rec(i, ts, u):
+        return {"type": "assistant", "timestamp": ts, "message": {"id": i, "model": "claude-opus-5-5", "usage": u}}
+    cost_rec = {"type": "cost-state", "totalCostUSD": exact(first), "modelUsage": {"claude-opus-5-5": {
+        "costUSD": exact(first)}}}
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d) / "proj"
+        proj.mkdir()
+        f = proj / "s.jsonl"
+        f.write_text("\n".join(json.dumps(r, separators=(",", ":")) for r in [
+            rec("a", "2026-10-09T00:00:01Z", first), cost_rec,
+            rec("b", "2026-10-09T00:00:09Z", second)]) + "\n")
+        got, is_exact, _, _ = claude.session_cost(f)
+    assert not is_exact
+    assert abs(got - (exact(first) + exact(second))) < 1e-9, (got, exact(first) + exact(second))
 
 
 def test_exec_leaves_no_leaked_semaphores():

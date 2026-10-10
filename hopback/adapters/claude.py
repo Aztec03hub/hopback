@@ -374,20 +374,48 @@ def last_line_with(path, marker, chunk=4 * 1024 * 1024, errors=None):
     return None, None
 
 
-def weighted_tokens(u):
+# Cache-read price relative to the input price, by model prefix (Anthropic's
+# published pricing, as in tokenlens/pricing.py, checked 2026-10-09). Most
+# models read at 0.1x; Opus 5.5 and Sonnet 5.5 at 0.05x; Fable 5.1 and
+# Mythos 5.1 at 0.025x. An unknown model gets the default.
+READ_MULT = (("claude-opus-5-5", 0.05), ("claude-sonnet-5-5", 0.05),
+             ("claude-fable-5-1", 0.025), ("claude-mythos-5-1", 0.025))
+READ_DEFAULT = 0.1
+WRITE_5M, WRITE_1H = 1.25, 2
+
+
+def read_mult(model):
+    m = model or ""
+    return next((x for k, x in READ_MULT if m.startswith(k)), READ_DEFAULT)
+
+
+def weighted_tokens(u, model=None):
     """Tokens weighted by their price relative to the input price.
 
     These ratios are Anthropic's published pricing structure: output is 5x the
-    input price, cache reads 0.1x, 5-minute cache writes 1.25x and 1-hour cache
-    writes 2x. The base price itself is never hard-coded; see model_rates().
+    input price (thinking is billed as output), cache reads per read_mult(model),
+    5-minute cache writes 1.25x and 1-hour cache writes 2x, per call. The base
+    price itself is never hard-coded; see model_rates().
+
+    A compaction call can have zero top-level usage with the real numbers in
+    usage.iterations[]; those are used when the top level carries nothing.
     """
+    w = _weighted_flat(u, model)
+    if not w:
+        w = sum(_weighted_flat(it, model) for it in u.get("iterations") or ()
+                if isinstance(it, dict))
+    return w
+
+
+def _weighted_flat(u, model):
     cc = u.get("cache_creation") or {}
     w1h = cc.get("ephemeral_1h_input_tokens") or 0
     w5m = cc.get("ephemeral_5m_input_tokens")
     if w5m is None:
         w5m = (u.get("cache_creation_input_tokens") or 0) - w1h
     return ((u.get("input_tokens") or 0) + 5 * (u.get("output_tokens") or 0)
-            + 0.1 * (u.get("cache_read_input_tokens") or 0) + 1.25 * w5m + 2 * w1h)
+            + read_mult(model) * (u.get("cache_read_input_tokens") or 0)
+            + WRITE_5M * w5m + WRITE_1H * w1h)
 
 
 def usage_by_model(path, after=None, before=None):
@@ -418,7 +446,7 @@ def usage_by_model(path, after=None, before=None):
                     continue
                 msg = rec.get("message") or {}
                 if msg.get("usage") and msg.get("model") and msg.get("id"):
-                    seen[msg["id"]] = (msg["model"], weighted_tokens(msg["usage"]))
+                    seen[msg["id"]] = (msg["model"], weighted_tokens(msg["usage"], msg["model"]))
     out = {}
     for model, w in seen.values():
         out[model] = out.get(model, 0) + w
@@ -454,18 +482,21 @@ def _num(v):
     return v if ok else None
 
 
-_WEIGHTS = (("inputTokens", 1), ("outputTokens", 5), ("cacheReadInputTokens", 0.1),
-            ("cacheCreationInputTokens", 1.25))
-
-
-def _entry_rate(u):
+def _entry_rate(model, u):
     """Dollars per weighted token from one modelUsage entry, or None when the
     entry is malformed (not a dict, a token count or the cost null, a string,
     NaN) or has no cost. A count that is absent counts as 0."""
     if not isinstance(u, dict):
         return None
     cost = _num(u.get("costUSD"))
-    counts = [(_num(u[k]) if k in u else 0, wt) for k, wt in _WEIGHTS]
+    # ponytail: a modelUsage aggregate has no 5m/1h split; main sessions write
+    # ~100% 1h cache, so the cache-creation term is weighted 2x (not 1.25x).
+    # A session's OWN rate does not use this: session_cost calibrates from its
+    # per-call usage, which keeps the TTL split.
+    weights = (("inputTokens", 1), ("outputTokens", 5),
+               ("cacheReadInputTokens", read_mult(model)),
+               ("cacheCreationInputTokens", WRITE_1H))
+    counts = [(_num(u[k]) if k in u else 0, wt) for k, wt in weights]
     if cost is None or cost <= 0 or any(c is None for c, _ in counts):
         return None
     w = sum(c * wt for c, wt in counts)
@@ -523,7 +554,7 @@ def _file_rates(store, max_files):
             usage = rec.get("modelUsage") if isinstance(rec, dict) else None
             rates = {}
             for model, u in (usage if isinstance(usage, dict) else {}).items():
-                rate = _entry_rate(u)
+                rate = _entry_rate(model, u)
                 if rate is not None:
                     rates[model] = rate
             if rates:
