@@ -212,7 +212,9 @@ def unwrap(words):
         used = [lits[k] and not _NONLIT.search(words[k]) for k in range(1, len(words) - len(rest))]
         if name == "timeout" and rest:
             used.append(lits[len(lits) - len(rest)] and not _NONLIT.search(rest[0]))
-        if not all(used) and not (name == "env" and names & {"-S", "--split-string"}):                             # word splitting could shift which program runs
+        if name == "env" and names & {"-S", "--split-string"}:   # only the -S value itself may be non-literal
+            used = [u for k, u in enumerate(used, 1) if not (words[k - 1] in ("-S", "--split-string") or words[k].startswith("--split-string="))]
+        if not all(used):                             # word splitting could shift which program runs
             return Unwrapped(tuple(words), tuple(peeled), "nonliteral-operand", tuple(options))
         j = 0
         if name == "env":
@@ -390,6 +392,32 @@ def _git_cmd_key(key, value):
 _GIT_TRANSPORT = re.compile(r"(?:^|=)[A-Za-z0-9+.-]+::")    # `ext::sh -c x`, `<helper>::addr`
 
 
+def _unquoted_expansion(raw):
+    """True if `$` or a backtick sits outside quotes: word splitting could add options.
+
+    Scans left to right like the shell: `\\x` is one quoted character, `'..'` and `$'..'`
+    and `".."` are skipped, anything else with `$` or a backtick counts. An unterminated
+    quote counts too."""
+    i, n = 0, len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\\":
+            i += 2
+        elif c in "'\"" or (c == "$" and raw[i + 1:i + 2] == "'"):
+            q = "'" if c == "$" else c
+            i += 2 if c == "$" else 1
+            while i < n and raw[i] != q:
+                i += 2 if raw[i] == "\\" and (q == '"' or c == "$") else 1
+            if i >= n:
+                return True
+            i += 1
+        elif c in "$`":
+            return True
+        else:
+            i += 1
+    return False
+
+
 def git_args(words):
     """Split `git [global options] subcommand args` (words start with git; strings
     or Word objects). Git reads its global options exactly: `-C path` and `-c name=val` are two
@@ -400,6 +428,7 @@ def git_args(words):
     (runs_command True)."""
     lits = [getattr(w, "literal", True) for w in words[1:]]
     args, opts, i = [getattr(w, "text", w) for w in words[1:]], [], 0
+    raws = [getattr(w, "raw", getattr(w, "text", w)) for w in words[1:]]
     while i < len(args):
         a = args[i]
         name, eq, val = a.partition("=") if a.startswith("--") else (a, "", "")
@@ -407,13 +436,19 @@ def git_args(words):
             opts.append((a, None))
         elif a in _GIT_VALUES and i + 1 < len(args):
             opts.append((a, args[i + 1]))
+            if a not in ("-c", "--config-env") and _unquoted_expansion(raws[i + 1]):
+                return GitArgs(tuple(opts[:-1]), None, tuple(args[i:]), False, args[i + 1], True)
             if a in ("-c", "--config-env"):
                 k, e, v = args[i + 1].partition("=")
                 if _git_cmd_key(k, v if e and a == "-c" else None) or _nonlit(k):
                     return GitArgs(tuple(opts[:-1]), None, tuple(args[i:]), False, args[i + 1], True)
             i += 1
+        elif eq and name == "--exec-path":               # git runs ./git-<cmd> from that directory
+            return GitArgs(tuple(opts), None, tuple(args[i:]), False, a, True)
         elif eq and name in _GIT_VALUES:
             opts.append((name, val))
+            if name != "--config-env" and _unquoted_expansion(raws[i]):
+                return GitArgs(tuple(opts[:-1]), None, tuple(args[i:]), False, a, True)
             if name == "--config-env":
                 if _git_cmd_key(val.partition("=")[0], None):                # the value is an env var name: unreadable
                     return GitArgs(tuple(opts[:-1]), None, tuple(args[i:]), False, val, True)
@@ -475,7 +510,7 @@ def nested(words, unwrap_first=True):
     if prog in ("su", "runuser"):
         opts, rest, ok = getopt(args, SU, permute=True)  # `su root -c text`
         texts = [v for o, v in opts if o in ("-c", "--command", "--session-command")]
-        if not ok:
+        if not ok or any(_NONLIT.search(a) for a in args):   # `-u $U` can split into more options
             return [Nested(prog, "unknown", words=tuple(args))]
         if texts:
             return [Nested(prog, "text", text=texts[-1])]
