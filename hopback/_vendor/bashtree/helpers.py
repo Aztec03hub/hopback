@@ -393,7 +393,8 @@ _GIT_TRANSPORT = re.compile(r"(?:^|=)[A-Za-z0-9+.-]+::")    # `ext::sh -c x`, `<
 
 
 def _unquoted_expansion(raw):
-    """True if `$` or a backtick sits outside quotes: word splitting could add options.
+    """True if `$`, a backtick, a glob character or a `{..}` sits outside quotes: word splitting,
+    globbing or brace expansion could add options.
 
     Scans left to right like the shell: `\\x` is one quoted character, `'..'` and `$'..'`
     and `".."` are skipped, anything else with `$` or a backtick counts. An unterminated
@@ -411,7 +412,9 @@ def _unquoted_expansion(raw):
             if i >= n:
                 return True
             i += 1
-        elif c in "$`":
+        elif c in "$`*?[":
+            return True
+        elif c == "{" and "}" in raw[i:]:        # brace expansion makes several words
             return True
         else:
             i += 1
