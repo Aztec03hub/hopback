@@ -24,7 +24,7 @@ Known grammar limits (measured 2026-10-08 on 162,750 real commands):
   an unquoted control character, and a reserved word where a command name goes;
 - a space-indented heredoc terminator (bash rejects it) is accepted;
 - parse time is quadratic or worse on many malformed shapes, and the grammar
-  can't be cancelled, so a source over IN_PROCESS_BYTES, or with any non-ASCII
+  can't be cancelled, so a source over IN_PROCESS_BYTES, or with a character outside the BMP
   character, is parsed in a child
   given up at DEADLINE; cheap counts (MAX_HEREDOCS, MAX_ARRAYS, MAX_BRACKETS,
   MAX_PIPES, MAX_BYTES) run first. All of these give "too-big", as does
@@ -64,6 +64,7 @@ MAX_BRACKETS = 10_000
 # keeps a crash in the grammar (a SIGSEGV on U+10FFFF after `${`) out of the
 # caller; it costs about 30 ms a parse.
 IN_PROCESS_BYTES = 8 * 1024
+_ASTRAL = re.compile("[\U00010000-\U0010ffff]")        # code points outside the BMP
 DEADLINE = 3.0
 ALWAYS_CHILD = os.environ.get("BASHTREE_ALWAYS_CHILD") == "1"   # a hook that must survive a crash in the grammar sets this
 CHILD_MEMORY = 2 << 30                              # address space the parse child may use (a 1 MB input peaks near 0.6 GB)
@@ -1020,9 +1021,11 @@ def parse(text):
     src = text.encode("utf-8", "surrogatepass")
     if len(src) > MAX_BYTES:
         return Result(TOO_BIG, reason=f"over {MAX_BYTES} bytes")
-    # Non-ASCII text goes to the child too: py-tree-sitter 0.26.0 segfaults in the scanner on
-    # `${` followed by U+F0000 and up (found 2026-10-09), and a crash must not take the caller down.
-    if ALWAYS_CHILD or len(src) > IN_PROCESS_BYTES or not text.isascii():
+    # Text outside the BMP goes to the child too: py-tree-sitter 0.26.0 segfaults in the scanner on
+    # `${` followed by a code point from about U+F4000 up (found 2026-10-09; the BMP and planes 1-2 were
+    # clean), and a crash must not take the caller down. Plain non-ASCII text stays in process: sending
+    # it all to the child made hopback's list scan 80 s long.
+    if ALWAYS_CHILD or len(src) > IN_PROCESS_BYTES or _ASTRAL.search(text):
         return _parse_in_child(src)
     return _parse_bytes(src)
 
