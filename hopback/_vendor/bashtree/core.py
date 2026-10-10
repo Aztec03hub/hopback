@@ -32,12 +32,17 @@ Known grammar limits (measured 2026-10-08 on 162,750 real commands):
   line of more than MAX_COMMANDS commands;
 - `x=1 >f` (an assignment with a redirect) is a syntax error to it.
 """
+import atexit
 import os
 import pickle
 import re
+import select
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from pathlib import Path
 from dataclasses import dataclass, replace
 
@@ -415,7 +420,13 @@ def _redirect_plain(node, src):
                       (start.start_byte, start.end_byte) if start else span)
         fd = next((c for c in node.children if c.type == "file_descriptor"), None)
         hb = next((c for c in node.children if c.type == "heredoc_body"), None)
-        body = _heredoc_text(src[hb.start_byte:hb.end_byte] if hb else b"", op == "<<-", quoted)
+        bs = hb.start_byte if hb else 0
+        while hb and delim and bs >= 2 and src[bs - 1] == 10:
+            ls = src.rfind(b"\n", 0, bs - 1) + 1
+            if src[ls:bs - 1].strip(b" \t"):
+                break
+            bs = ls                  # the grammar drops leading blank (or blank-looking) lines from the body
+        body = _heredoc_text(src[bs:hb.end_byte] if hb else b"", op == "<<-", quoted)
         if start and _opener_spans(node, src, start.end_byte):
             body = None           # the opener line spans lines (a quote or `$(`): the body is not established
         return Redirect(op, _raw(fd, src) if fd else None, target, quoted, span, (), body)
@@ -1082,33 +1093,169 @@ def parse(text):
     return _parse_bytes(src)
 
 
-def _parse_in_child(src):
-    """_parse_bytes(src) in a child interpreter, killed at DEADLINE. It imports
-    this very package (its root directory goes first), then the parent's
-    sys.path, with -I so that neither its working directory nor PYTHON*
-    variables can put other code first."""
+_CHILD_LOOP = (
+    "import sys, struct, pickle; from {pkg}.core import _parse_bytes\n"
+    "i, o = sys.stdin.buffer, sys.stdout.buffer\n"
+    "while True:\n"
+    "    h = i.read(8)\n"
+    "    if len(h) < 8:\n"
+    "        break                                    # parent closed stdin or died: exit, never orphaned\n"
+    "    p = pickle.dumps(_parse_bytes(i.read(struct.unpack('>Q', h)[0])))\n"
+    "    o.write(struct.pack('>Q', len(p)) + p); o.flush()\n")
+
+
+def _child_code():
+    """Program of the long-lived parse child. It imports this very package (its root directory goes
+    first), then the parent's sys.path, with -I so that neither its working directory nor PYTHON*
+    variables can put other code first. Linux gets a memory cap, so a runaway parse ends in
+    MemoryError there instead of the kernel's OOM killer picking a victim."""
     pkg = __package__
     root = Path(__file__).resolve().parents[len(pkg.split("."))]
     path = [str(root)] + [p for p in sys.path if p]
-    # A memory cap in the child (Linux), so a runaway parse ends in MemoryError there
-    # instead of the kernel's OOM killer picking a victim.
     cap = ("import resource; resource.setrlimit(resource.RLIMIT_AS, (%d, %d)); " % (CHILD_MEMORY, CHILD_MEMORY)
            if sys.platform == "linux" else "")
-    code = (f"{cap}import sys, pickle; sys.path[:0] = {path!r}; from {pkg}.core import _parse_bytes; "
-            "sys.stdout.buffer.write(pickle.dumps(_parse_bytes(sys.stdin.buffer.read())))")
-    try:
-        done = subprocess.run([sys.executable, "-I", "-c", code], input=src, capture_output=True,
-                              timeout=DEADLINE, check=False)
-    except subprocess.TimeoutExpired:
+    return f"{cap}import sys; sys.path[:0] = {path!r}\n" + _CHILD_LOOP.format(pkg=pkg)
+
+
+class _Child:
+    """One long-lived parse child, owned by the process (pid) that started it."""
+
+    def __init__(self):
+        self.owner = os.getpid()
+        # stderr goes to a file, not a pipe nobody drains: a noisy child cannot stall on it
+        self.err = tempfile.TemporaryFile()
+        self.proc = subprocess.Popen([sys.executable, "-I", "-c", _child_code()], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=self.err)
+        os.set_blocking(self.proc.stdin.fileno(), False)  # writes are bounded by the deadline (see _write)
+
+    @staticmethod
+    def _wait(fd, event, end):
+        """True when fd is ready for event, False at the deadline. poll, not select: select fails for fd >= 1024."""
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        p = select.poll()
+        p.register(fd, event)
+        return bool(p.poll(left * 1000 + 1))
+
+    def _write(self, data, end):
+        """True when all of data went into the pipe, False at the deadline. Raises BrokenPipeError."""
+        fd, view = self.proc.stdin.fileno(), memoryview(data)
+        while view:
+            try:
+                view = view[os.write(fd, view):]
+            except BlockingIOError:
+                if not self._wait(fd, select.POLLOUT, end):
+                    return False
+        return True
+
+    def _read(self, n, end):
+        """n bytes, or None at the deadline, or what arrived before the child's end of file."""
+        fd, buf = self.proc.stdout.fileno(), b""
+        while len(buf) < n:
+            if not self._wait(fd, select.POLLIN, end):
+                return None
+            chunk = os.read(fd, n - len(buf))
+            if not chunk:
+                return buf
+            buf += chunk
+        return buf
+
+    def _stderr_tail(self):
+        self.err.seek(0, 2)
+        self.err.seek(max(0, self.err.tell() - 2000))
+        return self.err.read()
+
+    def ask(self, src):
+        """("ok", Result) | ("timeout", None) | ("dead", (returncode, stderr))."""
+        end = time.monotonic() + DEADLINE
+        body = None
+        try:
+            if not self._write(struct.pack(">Q", len(src)) + src, end):
+                return "timeout", None
+            head = self._read(8, end)
+            if head is None:
+                return "timeout", None
+            if len(head) == 8:
+                body = self._read(struct.unpack(">Q", head)[0], end)
+                if body is None:
+                    return "timeout", None
+        except BrokenPipeError:
+            pass                                         # the child died before reading: reported as dead below
+        if body is None or len(body) < struct.unpack(">Q", head)[0]:
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:            # closed its stdout but still runs: it is no use to us
+                self.proc.kill()
+                self.proc.wait()
+            return "dead", (self.proc.returncode, self._stderr_tail())
+        return "ok", pickle.loads(body)
+
+    def stop(self):
+        self.proc.kill()
+        try:
+            self.proc.wait(timeout=5)
+        finally:
+            for f in (self.proc.stdin, self.proc.stdout, self.err):
+                f.close()
+
+
+_child = None
+_child_lock = threading.Lock()
+EXIT_LOCK_WAIT = 2.0
+
+
+def _forget_child_after_fork():
+    # A forked process must not talk to its parent's child (and its lock may have been held).
+    global _child, _child_lock
+    _child, _child_lock = None, threading.Lock()
+
+
+os.register_at_fork(after_in_child=_forget_child_after_fork)
+
+
+@atexit.register
+def _stop_child():
+    c = _child
+    if c is None or c.owner != os.getpid() or c.proc.poll() is not None:
+        return
+    if _child_lock.acquire(timeout=EXIT_LOCK_WAIT):
+        try:
+            c.stop()
+        finally:
+            _child_lock.release()
+    else:
+        c.proc.kill()                                    # a thread is stuck mid-request: end the child, leave its pipes to that thread
+
+
+def _parse_in_child(src):
+    """_parse_bytes(src) in the long-lived child interpreter, killed at DEADLINE and started anew for
+    the next parse after a crash, a timeout or a memory error."""
+    global _child
+    with _child_lock:
+        if _child is None or _child.owner != os.getpid() or _child.proc.poll() is not None:
+            _child = _Child()
+        try:
+            kind, data = _child.ask(src)
+        except BaseException:
+            # Anything else (^C, a parent-side error): a reply may still be on its way, and the next
+            # request must never read it as its own answer.
+            c, _child = _child, None
+            c.stop()
+            raise
+        if kind == "ok":
+            return data
+        if _child.proc.poll() is None:
+            _child.stop()
+        _child = None
+    if kind == "timeout":
         return Result(TOO_BIG, reason=f"parsing took over {DEADLINE} s")
-    if done.returncode < 0:                          # killed by a signal: out of memory, or a crash in the grammar
-        return Result(TOO_BIG, reason=f"the parse child was killed (signal {-done.returncode})")
-    if done.returncode == 1 and b"MemoryError" in done.stderr[-2000:]:
+    code, err = data
+    if code < 0:                                     # killed by a signal: out of memory, or a crash in the grammar
+        return Result(TOO_BIG, reason=f"the parse child was killed (signal {-code})")
+    if code == 1 and b"MemoryError" in err[-2000:]:
         return Result(TOO_BIG, reason=f"parsing needed over {CHILD_MEMORY >> 20} MB")
-    if done.returncode:
-        raise RuntimeError(f"bashtree's parse child failed ({done.returncode}): "
-                           f"{done.stderr.decode('utf-8', 'replace')[-500:]}")
-    return pickle.loads(done.stdout)                 # our own child's output, nothing else's
+    raise RuntimeError(f"bashtree's parse child failed ({code}): {err.decode('utf-8', 'replace')[-500:]}")                 # our own child's output, nothing else's
 
 
 class _Src(bytes):
