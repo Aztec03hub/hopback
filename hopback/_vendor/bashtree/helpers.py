@@ -423,7 +423,8 @@ def _unquoted_expansion(raw):
 
 def git_args(words):
     """Split `git [global options] subcommand args` (words start with git; strings
-    or Word objects). Git reads its global options exactly: `-C path` and `-c name=val` are two
+    or Word objects; a string is taken as the already-unquoted text, so its quote characters
+    count as literal: pass Word objects when quoting matters). Git reads its global options exactly: `-C path` and `-c name=val` are two
     words, `-C/x`, `-ccore.x=1` and `-pP` are errors, long options are not
     abbreviated; `--x=v` or `--x v` for the valued ones, `--exec-path[=v]` and
     `--list-cmds=v` only attached. Anything else before the subcommand is ok False,

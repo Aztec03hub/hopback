@@ -1117,6 +1117,9 @@ def _child_code():
     return f"{cap}import sys; sys.path[:0] = {path!r}\n" + _CHILD_LOOP.format(pkg=pkg)
 
 
+STDERR_TAIL = 16 * 1024      # enough for a long chained traceback to still end in its MemoryError
+
+
 class _Child:
     """One long-lived parse child, owned by the process (pid) that started it."""
 
@@ -1124,9 +1127,14 @@ class _Child:
         self.owner = os.getpid()
         # stderr goes to a file, not a pipe nobody drains: a noisy child cannot stall on it
         self.err = tempfile.TemporaryFile()
-        self.proc = subprocess.Popen([sys.executable, "-I", "-c", _child_code()], stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, stderr=self.err)
-        os.set_blocking(self.proc.stdin.fileno(), False)  # writes are bounded by the deadline (see _write)
+        self.proc = None
+        try:
+            self.proc = subprocess.Popen([sys.executable, "-I", "-c", _child_code()], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=self.err)
+            os.set_blocking(self.proc.stdin.fileno(), False)  # writes are bounded by the deadline (see _write)
+        except BaseException:
+            self.stop()                                  # no leaked temp file or child, whatever interrupted us
+            raise
 
     @staticmethod
     def _wait(fd, event, end):
@@ -1163,7 +1171,7 @@ class _Child:
 
     def _stderr_tail(self):
         self.err.seek(0, 2)
-        self.err.seek(max(0, self.err.tell() - 2000))
+        self.err.seek(max(0, self.err.tell() - STDERR_TAIL))
         return self.err.read()
 
     def ask(self, src):
@@ -1188,16 +1196,20 @@ class _Child:
             except subprocess.TimeoutExpired:            # closed its stdout but still runs: it is no use to us
                 self.proc.kill()
                 self.proc.wait()
-            return "dead", (self.proc.returncode, self._stderr_tail())
+            dead = self.proc.returncode, self._stderr_tail()
+            self.stop()                                  # close our ends now, not at garbage collection
+            return "dead", dead
         return "ok", pickle.loads(body)
 
     def stop(self):
-        self.proc.kill()
         try:
-            self.proc.wait(timeout=5)
+            if self.proc is not None:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
         finally:
-            for f in (self.proc.stdin, self.proc.stdout, self.err):
-                f.close()
+            for f in (self.proc and self.proc.stdin, self.proc and self.proc.stdout, self.err):
+                if f is not None:
+                    f.close()
 
 
 _child = None
@@ -1253,7 +1265,7 @@ def _parse_in_child(src):
     code, err = data
     if code < 0:                                     # killed by a signal: out of memory, or a crash in the grammar
         return Result(TOO_BIG, reason=f"the parse child was killed (signal {-code})")
-    if code == 1 and b"MemoryError" in err[-2000:]:
+    if code == 1 and b"MemoryError" in err:
         return Result(TOO_BIG, reason=f"parsing needed over {CHILD_MEMORY >> 20} MB")
     raise RuntimeError(f"bashtree's parse child failed ({code}): {err.decode('utf-8', 'replace')[-500:]}")                 # our own child's output, nothing else's
 
