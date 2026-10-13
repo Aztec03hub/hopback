@@ -1983,6 +1983,52 @@ def test_exec_leaves_no_leaked_semaphores():
     assert "leaked semaphore" not in out.stderr, out.stderr
 
 
+def _fact_run(root, **kw):
+    """claude.collect over one store; returns (rows, paths opened for reading)."""
+    real, opened = Path.open, []
+
+    def spy(self, *a, **k):
+        opened.append(self.name)
+        return real(self, *a, **k)
+    with mock.patch.object(Path, "open", spy), mock.patch.object(Path, "read_text", lambda s, *a, **k: opened.append(s.name) or ""):
+        rows = claude.collect(root, None, False, False, include_teams=True,
+                              include_scratch=True, **kw)[0]
+    return rows, [n for n in opened if n.endswith(".jsonl")]
+
+
+def _fact_root():
+    return next(s.root for s in discover() if s.tag == f"claude·{paths.this_host()}")
+
+
+def test_fact_cache_hit_skips_reading_and_change_rereads():
+    root, facts = _fact_root(), Path(CACHE) / "hopback" / "facts.bin"
+    facts.unlink(missing_ok=True)
+    cold, opened = _fact_run(root)
+    assert opened and facts.exists()
+    warm, opened = _fact_run(root)
+    assert warm == cold and opened == []
+    victim = next(root.glob("projects/*/*.jsonl"))
+    with victim.open("a") as fh:
+        fh.write("\n")
+    _, opened = _fact_run(root)
+    assert set(opened) == {victim.name}
+
+
+def test_fact_cache_corrupt_or_old_version_is_rebuilt():
+    import marshal
+    from hopback import factcache
+    root, facts = _fact_root(), Path(CACHE) / "hopback" / "facts.bin"
+    cold, _ = _fact_run(root)
+    facts.write_bytes(b"not marshal at all")
+    rows, opened = _fact_run(root)
+    assert rows == cold and opened
+    assert factcache.load()
+    facts.write_bytes(marshal.dumps((factcache.VERSION + 1, factcache.load())))
+    assert factcache.load() == {}
+    rows, opened = _fact_run(root)
+    assert rows == cold and opened
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
