@@ -2106,6 +2106,42 @@ def test_fact_cache_corrupt_or_old_version_is_rebuilt():
     assert rows == cold and opened
 
 
+def test_head_pass_feeds_both_consumers_and_pool_equals_serial():
+    from hopback import headpass, launches
+    root = _fact_root()
+    files = sorted(root.glob("projects/*/*.jsonl"))
+    serial = {str(p): headpass.both(p, False, False) for p in files}
+    for key, got in serial.items():
+        p = Path(key)
+        ep = claude.head_facts(p)[0] if got[0] is None else got[0]
+        assert (ep or "") == (claude.head_facts(p)[0] or "")
+        assert got[1] == launches.head_facts(p)
+    headpass.prefetch(files, workers=2, deep=False)
+    assert {k: launches.PRE_EXTRA[k] for k in serial} == {k: v[2] for k, v in serial.items()}
+    launches.PRE_EXTRA.clear()
+    launches.PRE_EP.clear()
+    launches.PRE_FACTS.clear()
+    headpass.prefetch(files, workers=2)
+    # One read: a consumer takes the prefetched value without opening the file.
+    p = files[0]
+    with mock.patch.object(Path, "open", side_effect=AssertionError("re-read")):
+        assert launches.head_facts(p) == serial[str(p)][1]
+    assert str(p) not in launches.PRE_FACTS          # handed out once
+
+
+def test_head_pass_pool_failure_falls_back_in_process():
+    import concurrent.futures
+    from hopback import headpass, launches
+    files = sorted(_fact_root().glob("projects/*/*.jsonl"))
+    launches.PRE_EP.clear()
+    launches.PRE_FACTS.clear()
+    with mock.patch.object(concurrent.futures, "ProcessPoolExecutor", side_effect=OSError("no fork")):
+        headpass.prefetch(files)
+    assert len(launches.PRE_FACTS) == len(files)
+    launches.PRE_FACTS.clear()
+    launches.PRE_EP.clear()
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
