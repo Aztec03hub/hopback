@@ -747,6 +747,78 @@ def test_spawned_sessions():
     os.environ["XDG_CACHE_HOME"] = CACHE
 
 
+def test_raw_candidate_cache():
+    """The raw scan (launch candidates per transcript) is stored apart from the
+    parser's verdicts: a hit reads no transcript, an appended file adds only
+    the new bytes, a corrupt file is rebuilt, and a version bump re-parses the
+    stored commands without re-reading the store."""
+    import json
+    from datetime import datetime, timezone
+    from hopback import launches
+    root = TMP / "rawstore" / ".claude"
+    proj = root / "projects" / "-p"
+    proj.mkdir(parents=True)
+    T = 1_800_000_000
+    prompt = "You are lane-y, an implementer for the lead. Read the brief and build it."
+
+    def rec(t, cmd=None, text=None):
+        ts = datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        if cmd is not None:
+            return json.dumps({"type": "assistant", "timestamp": ts, "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "x", "name": "Bash", "input": {"command": cmd}}]}}, separators=(",", ":")) + "\n"
+        return json.dumps({"type": "user", "timestamp": ts, "message": {"role": "user", "content": text}},
+                          separators=(",", ":")) + "\n"
+
+    parent = proj / "parent.jsonl"
+    parent.write_text(rec(T - 10, f"claude '{prompt}'") + rec(T - 5, "echo claude is great"))
+    (proj / "kid.jsonl").write_text(rec(T, text=prompt))
+    os.environ["XDG_CACHE_HOME"] = str(TMP / "rawcache")
+    try:
+        rpath, cpath = launches.raw_path(root), launches.cache_path(root)
+        assert launches.started_by(root, []) == {"kid": "parent"}
+        raw = launches.load_raw(rpath)
+        key = str(parent)
+        assert raw[key]["off"] == parent.stat().st_size and len(raw[key]["c"]) == 2, raw[key]
+        assert raw[key]["c"][0][2][0].startswith("claude "), raw[key]   # raw command text, no verdict
+
+        # Hit: a version bump drops the verdicts, but no transcript is scanned again.
+        with mock.patch.object(launches, "version", return_value="bumped"), \
+                mock.patch.object(launches, "candidates", side_effect=AssertionError("re-read")), \
+                mock.patch.object(launches, "head_facts", side_effect=AssertionError("re-read")):
+            assert launches.load_cache(cpath)["files"] == {}
+            assert launches.started_by(root, []) == {"kid": "parent"}
+
+        # The parser's verdict is recomputed from the stored text.
+        launches._VERDICT.clear()
+        with mock.patch.object(launches, "is_launch", return_value=False):
+            cpath.unlink()
+            assert launches.started_by(root, []) == {}
+        launches._VERDICT.clear()
+        cpath.unlink()
+
+        # Changed file: appended bytes are added to the stored scan.
+        with parent.open("a") as fh:
+            fh.write(rec(T + 500, "tmux new-window 'claude -p other'"))
+        launches.started_by(root, [])
+        assert len(launches.load_raw(rpath)[key]["c"]) == 3
+        assert launches.load_raw(rpath)[key]["off"] == parent.stat().st_size
+
+        # Corrupt file (and one with a damaged entry): rebuilt, same answer.
+        cpath.unlink()
+        for junk in ("{not json", json.dumps({"v": launches.RAW_V, "files": {key: {"off": 0, "c": [[1]]}}})):
+            rpath.write_text(junk)
+            assert launches.load_raw(rpath) == {} or key not in launches.load_raw(rpath)
+            cpath.unlink(missing_ok=True)
+            assert launches.started_by(root, []) == {"kid": "parent"}
+            assert len(launches.load_raw(rpath)[key]["c"]) == 3
+
+        # A raw scan from another candidate filter is ignored.
+        rpath.write_text(json.dumps({"v": "old", "files": {key: {"off": 1, "c": []}}}))
+        assert launches.load_raw(rpath) == {}
+    finally:
+        os.environ["XDG_CACHE_HOME"] = CACHE
+
+
 def test_foreign_owned_tmp():
     """Paths Claude Code would refuse to start over are found; a symlink to a
     root-owned file is not one, and a missing directory is fine."""
