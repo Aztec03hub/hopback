@@ -439,8 +439,11 @@ def explain(root, sid):
 def _save(path, obj, problems):
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(obj))
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)                     # holds command text from your transcripts
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(obj))
         tmp.replace(path)
     except OSError as exc:
         tmp.unlink(missing_ok=True)
