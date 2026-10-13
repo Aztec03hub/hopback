@@ -29,7 +29,8 @@ def save(entries, prefix):
     """Merge this store's live entries in; stale keys under prefix drop."""
     d = _dir()
     try:
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(d, 0o700)                               # holds paths and session facts
         with open(d / "facts.lock", "w") as lk:
             try:
                 fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -38,7 +39,9 @@ def save(entries, prefix):
             merged = {k: v for k, v in load().items() if not k.startswith(prefix)}
             merged.update(entries)
             tmp = d / f"facts.bin.{os.getpid()}"
-            tmp.write_bytes(marshal.dumps((VERSION, merged)))
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(marshal.dumps((VERSION, merged)))
             os.replace(tmp, d / "facts.bin")
     except OSError:
         pass

@@ -27,7 +27,10 @@ Speed: the first run finds launch candidates with ripgrep when it is installed
 (about 2 s over 10 GB) and otherwise with plain Python spread over the CPU
 cores.
 After that, only bytes appended since the last run are read, because
-transcripts are append-only. Results live in $XDG_CACHE_HOME/hopback.
+transcripts are append-only. Results live in $XDG_CACHE_HOME/hopback: the
+parser's verdicts in claude-launches-*, and apart from them the raw candidate
+commands per transcript in claude-candidates-*, so a parser or vendor change
+re-parses stored text instead of re-reading the store.
 """
 import bisect
 import functools
@@ -117,24 +120,75 @@ def launch_command(line):
     """The launching shell command in a transcript line, or None."""
     for _, inp in tool_calls(line):
         cmd = inp.get("command")
-        if isinstance(cmd, str) and is_launch(cmd):
+        if isinstance(cmd, str) and _is_launch(cmd):
             return cmd
     return None
 
 
-def launch_times(data, base=0):
-    """[time, byte offset] of each launch tool call in a chunk of transcript
-    bytes that starts at offset `base`."""
+_VERDICT = {}      # command text -> is_launch, within this run
+
+
+def _launch_chunk(cmds):
+    return [is_launch(c) for c in cmds]
+
+
+def _is_launch(cmd):
+    """is_launch, remembered by command text: the same command is run again
+    and again in a store."""
+    if cmd not in _VERDICT:
+        _VERDICT[cmd] = is_launch(cmd)
+    return _VERDICT[cmd]
+
+
+def warm(cands):
+    """Fill _VERDICT for the commands of `cands`, over several processes when
+    there are many (bashtree runs one child per process, so threads would only
+    queue on it; separate spawned processes each get their own)."""
+    todo = sorted({c for _, _, cmds in cands for c in cmds if c not in _VERDICT}, key=len, reverse=True)
+    if len(todo) < 300:
+        return
+    import concurrent.futures
+    import multiprocessing
+    n = min(12, os.cpu_count() or 1)
+    chunks = [todo[i::n * 4] for i in range(n * 4)]       # long ones spread evenly
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+                max_workers=n, mp_context=multiprocessing.get_context("spawn")) as pool:
+            for chunk, res in zip(chunks, pool.map(_launch_chunk, chunks)):
+                _VERDICT.update(zip(chunk, res))
+    except (OSError, ImportError, NotImplementedError, RuntimeError):
+        pass                                # the rest is parsed in this process, as before
+
+
+def candidates(data, base=0):
+    """[time, byte offset, [shell commands]] of each tool call line that may be
+    a launch, in a chunk of transcript bytes that starts at offset `base`. No
+    parsing: this is the raw result, stored apart from the parser's verdicts so
+    a parser change doesn't re-read the store."""
     out = []
     pos = 0
     for line in data.split(b"\n"):
         if b'"tool_use"' in line and b"claude" in line and _CANDIDATE.search(line):
             m = _TS.search(line)
             t = epoch(m[1].decode()) if m and b'"type":"assistant"' in line else None
-            if t and launch_command(line):
-                out.append([t, base + pos])
+            if t:
+                cmds = [c for _, inp in tool_calls(line)
+                        if isinstance(c := inp.get("command"), str)]
+                if cmds:
+                    out.append([t, base + pos, cmds])
         pos += len(line) + 1
     return out
+
+
+def launch_times(data, base=0):
+    """[time, byte offset] of each launch tool call in a chunk of transcript
+    bytes that starts at offset `base`."""
+    return parsed(candidates(data, base))
+
+
+def parsed(cands):
+    warm(cands)
+    return [[t, off] for t, off, cmds in cands if any(_is_launch(c) for c in cmds)]
 
 
 def head_facts(path):
@@ -173,7 +227,7 @@ def head_facts(path):
 
 
 def rg_launches(projects, sizes):
-    """{path: (launches, offset read up to)} for the whole store via ripgrep,
+    """{path: (candidates, offset read up to)} for the whole store via ripgrep,
     or None without it. Only bytes below each file's size in `sizes` (taken
     before the search) count, cut back to a whole line, so lines appended while
     rg ran are read by the normal incremental pass."""
@@ -208,7 +262,7 @@ def rg_launches(projects, sizes):
                 for off in offsets.get(key, ()):
                     if off < upto:
                         fh.seek(off)
-                        found += launch_times(fh.readline(), off)
+                        found += candidates(fh.readline(), off)
         except OSError:
             continue
         out[key] = (found, upto)
@@ -224,7 +278,7 @@ def _scan_whole(job):
     except OSError:
         return key, [], 0
     cut = data.rfind(b"\n") + 1
-    return key, (launch_times(data[:cut]) if b"claude" in data else []), cut
+    return key, (candidates(data[:cut]) if b"claude" in data else []), cut
 
 
 def py_launches(sizes):
@@ -311,6 +365,27 @@ def load_cache(cpath):
     return cache
 
 
+RAW_V = "1|" + RG_PATTERN      # bump with the candidate scan, not with the parser
+
+
+def raw_path(root):
+    return cache_path(root).with_name(cache_path(root).name.replace("claude-launches-", "claude-candidates-"))
+
+
+def load_raw(rpath):
+    """{transcript: {"off": bytes read, "c": candidates}}: the raw scan, valid
+    across parser changes. Anything unexpected is an empty store."""
+    try:
+        raw = json.loads(rpath.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict) or raw.get("v") != RAW_V or not isinstance(raw.get("files"), dict):
+        return {}
+    return {k: e for k, e in raw["files"].items()
+            if isinstance(e, dict) and isinstance(e.get("off"), int) and isinstance(e.get("c"), list)
+            and all(isinstance(c, list) and len(c) == 3 and isinstance(c[2], list) for c in e["c"])}
+
+
 def known_parents(root):
     """The verdicts from the last scan, read without scanning: for the preview
     pane, which runs once per cursor move."""
@@ -361,6 +436,21 @@ def explain(root, sid):
     return out
 
 
+def _save(path, obj, problems):
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)                     # holds command text from your transcripts
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(obj))
+        tmp.replace(path)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        problems.append(f"could not save the spawn-detection cache, so the next start scans "
+                        f"everything again ({exc})")
+
+
 def started_by(root, problems):
     """{session id: parent session id, or "" when several launches qualify}.
     What went wrong without stopping the scan is appended to `problems`."""
@@ -369,6 +459,9 @@ def started_by(root, problems):
     cpath = cache_path(root)
     cache = load_cache(cpath)
     known, verdicts = cache["files"], cache["verdicts"]
+    rpath = raw_path(root)
+    raw = load_raw(rpath)
+    raw_changed = False
     changed = False
     for gone in set(known) - set(files):
         del known[gone]
@@ -380,26 +473,40 @@ def started_by(root, problems):
             sizes[key] = path.stat().st_size
         except OSError:
             unreadable += 1                    # vanished or unreadable: missing from this pass
-    cold = [k for k in sizes if k not in known]
-    bulk = None
+    # A cold file with a stored raw scan needs no read of its transcript.
+    cold = [k for k in sizes if k not in known and not (k in raw and raw[k]["off"] <= sizes[k])]
     if len(cold) > 200:
         cold_sizes = {k: sizes[k] for k in cold}
         bulk = rg_launches(projects, cold_sizes)
         if bulk is None:
             bulk = py_launches(cold_sizes)
+        for k, (found, off) in bulk.items():
+            raw[k] = {"off": off, "c": found}
+            raw_changed = True
+    warm([c for k in sizes if k not in known and k in raw for c in raw[k]["c"]])
     for key, size in sizes.items():
         path = files[key]
         ent = known.get(key)
         if ent is None:
-            try:
-                first, frag, when = head_facts(path)
-            except OSError:
-                unreadable += 1                # not recorded: read afresh next time
-                continue
+            if key not in raw or raw[key]["off"] > size:       # none, or the file was rewritten smaller
+                raw[key] = {"off": 0, "c": []}                 # filled by the read below
+                raw_changed = True
+            h = raw.get(key, {}).get("h")
+            if isinstance(h, list) and len(h) == 3 and raw[key]["off"] <= size:
+                first, frag, when = h          # stored with the raw scan: no read
+            else:
+                try:
+                    first, frag, when = head_facts(path)
+                except OSError:
+                    unreadable += 1            # not recorded: read afresh next time
+                    continue
+                if key in raw:
+                    raw[key]["h"] = [first, frag, when]
+                    raw_changed = True
             ent = known[key] = {"first": first, "frag": frag, "when": when,
                                 "off": 0, "launch": []}
-            if bulk is not None and key in bulk:
-                ent["launch"], ent["off"] = bulk[key]
+            if key in raw and raw[key]["off"] <= size:
+                ent["launch"], ent["off"] = parsed(raw[key]["c"]), raw[key]["off"]
             changed = True
         if (ent["first"] is None or ent["frag"] is None) and size > ent["off"]:
             # Seen before its opening prompt was written; look again.
@@ -411,6 +518,7 @@ def started_by(root, problems):
             changed = True
         if size < ent["off"]:            # rewritten, not appended: start over
             ent["off"], ent["launch"] = 0, []
+            raw_changed = raw.pop(key, None) is not None or raw_changed
         if size > ent["off"]:
             try:
                 with path.open("rb") as fh:
@@ -422,7 +530,12 @@ def started_by(root, problems):
             # Only whole lines; a half-written last line is read next time.
             cut = data.rfind(b"\n") + 1
             if cut:
-                ent["launch"] += launch_times(data[:cut], ent["off"])
+                cands = candidates(data[:cut], ent["off"])
+                ent["launch"] += parsed(cands)
+                if key in raw and raw[key]["off"] == ent["off"]:
+                    raw[key]["c"] += cands
+                    raw[key]["off"] += cut
+                    raw_changed = True
                 ent["off"] += cut
                 changed = True
 
@@ -483,14 +596,8 @@ def started_by(root, problems):
     if unreadable:
         problems.append(f"{unreadable} session(s) not checked for a spawning launch: a transcript "
                         "could not be read; they are checked again next time")
+    if raw_changed:
+        _save(rpath, {"v": RAW_V, "files": {k: e for k, e in raw.items() if k in files}}, problems)
     if changed:
-        tmp = cpath.with_name(f"{cpath.name}.{os.getpid()}.tmp")
-        try:
-            cpath.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(cache))
-            tmp.replace(cpath)
-        except OSError as exc:
-            tmp.unlink(missing_ok=True)
-            problems.append(f"could not save the spawn-detection cache, so the next start scans "
-                            f"everything again ({exc})")
+        _save(cpath, cache, problems)
     return out
