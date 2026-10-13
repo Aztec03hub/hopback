@@ -1985,12 +1985,17 @@ def test_exec_leaves_no_leaked_semaphores():
 
 def _fact_run(root, **kw):
     """claude.collect over one store; returns (rows, paths opened for reading)."""
-    real, opened = Path.open, []
+    opened = []
 
-    def spy(self, *a, **k):
-        opened.append(self.name)
-        return real(self, *a, **k)
-    with mock.patch.object(Path, "open", spy), mock.patch.object(Path, "read_text", lambda s, *a, **k: opened.append(s.name) or ""):
+    def spy(fn):
+        # The per-file readers; the launches scan has its own cache and reads too.
+        def wrapped(path, *a, **k):
+            opened.append(path.name)
+            return fn(path, *a, **k)
+        return wrapped
+    with mock.patch.object(claude, "head_facts", spy(claude.head_facts)), \
+            mock.patch.object(claude, "scan", spy(claude.scan)), \
+            mock.patch.object(claude, "has_conversation", spy(claude.has_conversation)):
         rows = claude.collect(root, None, False, False, include_teams=True,
                               include_scratch=True, **kw)[0]
     return rows, [n for n in opened if n.endswith(".jsonl")]
@@ -2001,7 +2006,7 @@ def _fact_root():
 
 
 def test_fact_cache_hit_skips_reading_and_change_rereads():
-    root, facts = _fact_root(), Path(CACHE) / "hopback" / "facts.bin"
+    root, facts = _fact_root(), Path(os.environ["XDG_CACHE_HOME"]) / "hopback" / "facts.bin"
     facts.unlink(missing_ok=True)
     cold, opened = _fact_run(root)
     assert opened and facts.exists()
@@ -2017,7 +2022,7 @@ def test_fact_cache_hit_skips_reading_and_change_rereads():
 def test_fact_cache_corrupt_or_old_version_is_rebuilt():
     import marshal
     from hopback import factcache
-    root, facts = _fact_root(), Path(CACHE) / "hopback" / "facts.bin"
+    root, facts = _fact_root(), Path(os.environ["XDG_CACHE_HOME"]) / "hopback" / "facts.bin"
     cold, _ = _fact_run(root)
     facts.write_bytes(b"not marshal at all")
     rows, opened = _fact_run(root)
