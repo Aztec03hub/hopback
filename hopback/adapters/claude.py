@@ -161,7 +161,9 @@ def head_facts(path, max_lines=25, max_bytes=512 * 1024):
     of kilobytes, so a byte window silently stops before the entrypoint record:
     one session here has a 434 KB first line with the entrypoint on line 3.
     """
-    ep, seen = None, False
+    hit = launches.PRE_EP.pop(str(path), None)
+    if hit is not None:
+        return hit, True
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             lines, used = [], 0
@@ -173,6 +175,11 @@ def head_facts(path, max_lines=25, max_bytes=512 * 1024):
                 lines.append(line)
     except OSError:
         return None, False
+    return head_lines_facts(lines)
+
+
+def head_lines_facts(lines):
+    ep, seen = None, False
     for line in lines:
         if not line.startswith("{"):
             continue
@@ -837,6 +844,15 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
     counted = 0
     cache = factcache.load()
     dirty = False
+    need = []
+    for p in files:
+        st = p.stat()
+        e = cache.get(str(p))
+        if not e or e[0] != st.st_size or e[1] != st.st_mtime_ns or e[2] is None:
+            need.append(p)
+    if len(need) > 200:
+        from .. import headpass
+        headpass.prefetch(need, deep=deep, empty=include_empty)
     for path in files:
         if limit and counted >= limit:
             break
@@ -852,19 +868,20 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
         if ent[2] is None:
             ent[2] = head_facts(path)[0] or ""
             dirty = True
+        pre = launches.PRE_EXTRA.pop(key, (None, None))
         entrypoint = ent[2]
         is_sdk = bool(entrypoint and entrypoint.startswith("sdk"))
         if not include_teams and is_sdk:
             continue
         if not include_empty:
             if ent[3] is None:
-                ent[3] = has_conversation(path, st.st_size)
+                ent[3] = pre[0] if pre[0] is not None else has_conversation(path, st.st_size)
                 dirty = True
             if not ent[3]:
                 continue
 
         if deep not in ent[4]:
-            ent[4][deep] = scan(path, whole_file=deep)
+            ent[4][deep] = pre[1] if pre[1] is not None else scan(path, whole_file=deep)
             dirty = True
         got = ent[4][deep]
         cwd = got.get("cwd")

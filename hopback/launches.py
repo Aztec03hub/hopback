@@ -191,13 +191,27 @@ def parsed(cands):
     return [[t, off] for t, off, cmds in cands if any(_is_launch(c) for c in cmds)]
 
 
+# Facts read ahead by headpass.prefetch, one pass over each head for both
+# consumers; each is handed out once (pop), so a later call re-reads the file.
+PRE_FACTS = {}
+PRE_EP = {}
+PRE_EXTRA = {}      # claude.collect's (has_conversation, scan) for the same files
+
+
 def head_facts(path):
     """(time of the first record, the start of the opening prompt, the time
     that prompt arrived). The prompt is "" when there is none worth matching,
     and None when it may not have been written yet. OSError propagates: the
     caller retries the file next time rather than recording nothing."""
+    hit = PRE_FACTS.pop(str(path), None)
+    if hit is not None:
+        return hit
     with path.open("rb") as fh:
         head = fh.read(HEAD_BYTES)
+    return facts_from_head(head)
+
+
+def facts_from_head(head):
     first = frag = when = None
     for line in head.splitlines():
         if first is None:
@@ -484,6 +498,11 @@ def started_by(root, problems):
             raw[k] = {"off": off, "c": found}
             raw_changed = True
     warm([c for k in sizes if k not in known and k in raw for c in raw[k]["c"]])
+    need = [files[k] for k in sizes if k not in known
+            and not (isinstance(raw.get(k, {}).get("h"), list) and raw[k]["off"] <= sizes[k])]
+    if len(need) > 200:
+        from . import headpass
+        headpass.prefetch(need)
     for key, size in sizes.items():
         path = files[key]
         ent = known.get(key)
