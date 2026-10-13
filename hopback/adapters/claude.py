@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from .. import launches
+from .. import factcache, launches
 from ..fmt import size_str
 
 NAME = "claude"
@@ -835,6 +835,8 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
     started, problems = spawn_parents(root)
     rows = []
     counted = 0
+    cache = factcache.load()
+    dirty = False
     for path in files:
         if limit and counted >= limit:
             break
@@ -842,14 +844,29 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
         # reading 256 KB from each SDK session only to discard it.
         st = path.stat()
         sid = path.stem
-        entrypoint, _ = head_facts(path)
+        key = str(path)
+        ent = cache.get(key)
+        if not ent or ent[0] != st.st_size or ent[1] != st.st_mtime_ns:
+            ent = cache[key] = [st.st_size, st.st_mtime_ns, None, None, {}]
+            dirty = True
+        if ent[2] is None:
+            ent[2] = head_facts(path)[0] or ""
+            dirty = True
+        entrypoint = ent[2]
         is_sdk = bool(entrypoint and entrypoint.startswith("sdk"))
         if not include_teams and is_sdk:
             continue
-        if not include_empty and not has_conversation(path, st.st_size):
-            continue
+        if not include_empty:
+            if ent[3] is None:
+                ent[3] = has_conversation(path, st.st_size)
+                dirty = True
+            if not ent[3]:
+                continue
 
-        got = scan(path, whole_file=deep)
+        if deep not in ent[4]:
+            ent[4][deep] = scan(path, whole_file=deep)
+            dirty = True
+        got = ent[4][deep]
         cwd = got.get("cwd")
         guessed = cwd is None
         cwd = cwd or decode_dir(path.parent)
@@ -900,6 +917,10 @@ def collect(root, limit, here_only, deep, include_teams=True, include_scratch=Fa
             "named": bool(got.get("customTitle")),
             "guessed": guessed,
         })
+    if dirty:
+        # With `only` or a limit just some files were visited: merge, prune nothing.
+        factcache.save({str(p): cache[str(p)] for p in files if str(p) in cache},
+                       str(root / "projects") + "/" if only is None and not limit else "\0")
     return rows, len(files), problems
 
 
