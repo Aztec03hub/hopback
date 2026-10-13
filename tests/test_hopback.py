@@ -559,6 +559,7 @@ def test_pool_init_warms_in_the_background_and_scans_once():
     store = HOME / ".claude" / "projects"
     nfiles = len(list(store.glob("*/*.jsonl")))
     claude._RATES.clear()
+    claude.STOP.clear()    # an earlier app's late shutdown may have set it; it cuts a scan short
     real = claude.last_line_with
     calls, entered, gate = [], threading.Event(), threading.Event()
 
@@ -1078,7 +1079,15 @@ def test_review_view_opens_with_the_cursor_on_screen():
 
 def test_damaged_state_is_kept():
     """A damaged hidden/review file is moved aside and reported, never
-    overwritten; an unreadable one raises instead of reading as empty."""
+    overwritten; an unreadable one raises instead of reading as empty. Runs in
+    its own state dir: a straggler thread of an earlier app test that reads or
+    saves the shared one would move the planted file aside or add a copy."""
+    with tempfile.TemporaryDirectory(prefix="hopback-damaged-") as own:
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": own}):
+            _damaged_state_body()
+
+
+def _damaged_state_body():
     for path, load in ((cli.hidden_path(), cli.load_hidden), (cli.review_path(), cli.load_review)):
         path.parent.mkdir(parents=True, exist_ok=True)
         for bad in (b"[", b'["a\xff"]', b"[" * 100000):     # truncated, bad UTF-8, too deep
