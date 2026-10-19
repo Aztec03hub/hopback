@@ -667,11 +667,66 @@ def _entry(c, n, kids, st, extra):
     return None
 
 
+class _Unsafe(Exception):
+    """A statement shape that cannot be put right: parse() gives syntax-error."""
+
+
+class _Virtual:
+    """A list or pipeline node built by _regroup, shaped like a tree-sitter node."""
+    parent, is_named = None, True
+    _next = 0
+
+    def __init__(self, type_, children):
+        self.type, self.children = type_, children
+        self.start_byte, self.end_byte = children[0].start_byte, children[-1].end_byte
+        _Virtual._next += 1
+        self.id = ("virtual", _Virtual._next)
+
+
+def _regroup(n):
+    """The grammar nests `a | b | c && d` as pipeline(a, [b | c && d]): the
+    pipeline holds the && list. Bash binds `|` tighter than `&&`/`||`, which are
+    left-associative. Flatten the whole list/pipeline and rebuild it that way.
+    Returns n itself when nothing is nested wrongly."""
+    flat, stack, wrong = [], [n], False
+    while stack:
+        c = stack.pop()
+        if c.type == "comment":
+            continue
+        if c.type in ("list", "pipeline"):
+            wrong = wrong or (c.type == "pipeline" and any(k.type == "list" for k in c.children))
+            stack.extend(reversed(c.children))
+        else:
+            flat.append(c)
+    if not wrong:
+        return n
+    segs = [[]]
+    for c in flat:
+        if c.type in ("&&", "||"):
+            segs.append(c)
+            segs.append([])
+        else:
+            segs[-1].append(c)
+    for k, seg in enumerate(segs):
+        # operands and pipe tokens must alternate, starting and ending on an operand
+        if k % 2 == 0 and (not seg or len(seg) % 2 == 0 or any(x.is_named == (j % 2 == 1) for j, x in enumerate(seg))):
+            raise _Unsafe
+    acc = None
+    for k, seg in enumerate(segs):
+        if k % 2:
+            continue
+        node = seg[0] if len(seg) == 1 else _Virtual("pipeline", seg)
+        acc = node if acc is None else _Virtual("list", [acc, segs[k - 1], node])
+    return acc
+
+
 def _walk(root, src):
     out = []
     stack = [(root, _State((), (None, None), False, False, False, (), None))]
     while stack:
         n, st = stack.pop()
+        if n.type in ("list", "pipeline") and n.parent is not None and n.parent.type not in ("list", "pipeline"):
+            n = _regroup(n)                          # a virtual node's parent is None: never redone
         t = n.type
         kids = n.children                            # a fresh list per access: read once
         if _is_command(n, st.ptype):
@@ -1352,7 +1407,10 @@ def _parse_bytes(src):
                     return Result(SYNTAX_ERROR, reason=FALLBACK_REFUSED)   # a quote or `$(` spans the opener line: the blanked text is not the word
     if tree.root_node.has_error:
         return Result(SYNTAX_ERROR, reason="tree-sitter-bash reports a syntax error")
-    walked = _walk(tree.root_node, src)
+    try:
+        walked = _walk(tree.root_node, src)
+    except _Unsafe:
+        return Result(SYNTAX_ERROR, reason="a pipeline and a && or || list the grammar nested wrongly")
     if walked is not None and getattr(src, "heredocs", None) and src.used != set(src.heredocs):
         return Result(SYNTAX_ERROR, reason=FALLBACK_REFUSED)
     if walked is None:
